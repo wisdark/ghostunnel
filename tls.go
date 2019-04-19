@@ -18,10 +18,7 @@ package main
 
 import (
 	"crypto/tls"
-	"crypto/x509"
-	"errors"
 	"fmt"
-	"io/ioutil"
 	"strings"
 
 	"github.com/square/ghostunnel/certloader"
@@ -41,7 +38,7 @@ var cipherSuites = map[string][]uint16{
 }
 
 // Build reloadable certificate
-func buildCertificate(keystorePath, certPath, keyPath, keystorePass string) (certloader.Certificate, error) {
+func buildCertificate(keystorePath, certPath, keyPath, keystorePass, caBundlePath string) (certloader.Certificate, error) {
 	if hasPKCS11() {
 		if keystorePath != "" {
 			return buildCertificateFromPKCS11(keystorePath)
@@ -53,10 +50,10 @@ func buildCertificate(keystorePath, certPath, keyPath, keystorePass string) (cer
 		return buildCertificateFromCertstore()
 	}
 	if keyPath != "" && certPath != "" {
-		return certloader.CertificateFromPEMFiles(certPath, keyPath)
+		return certloader.CertificateFromPEMFiles(certPath, keyPath, caBundlePath)
 	}
 	if keystorePath != "" {
-		return certloader.CertificateFromKeystore(keystorePath, keystorePass)
+		return certloader.CertificateFromKeystore(keystorePath, keystorePass, caBundlePath)
 	}
 	return nil, nil
 }
@@ -77,28 +74,9 @@ func hasKeychainIdentity() bool {
 	return keychainIdentity != nil && *keychainIdentity != ""
 }
 
-func caBundle(caBundlePath string) (*x509.CertPool, error) {
-	if caBundlePath == "" {
-		return x509.SystemCertPool()
-	}
-
-	caBundleBytes, err := ioutil.ReadFile(caBundlePath)
-	if err != nil {
-		return nil, err
-	}
-
-	bundle := x509.NewCertPool()
-	ok := bundle.AppendCertsFromPEM(caBundleBytes)
-	if !ok {
-		return nil, errors.New("unable to read certificates from CA bundle")
-	}
-
-	return bundle, nil
-}
-
 // buildConfig reads command-line options and builds a tls.Config
 func buildConfig(enabledCipherSuites string, caBundlePath string) (*tls.Config, error) {
-	ca, err := caBundle(caBundlePath)
+	ca, err := certloader.LoadTrustStore(caBundlePath)
 	if err != nil {
 		return nil, err
 	}

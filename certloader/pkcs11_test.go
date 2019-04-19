@@ -34,7 +34,7 @@ func TestInvalidPKCS11Module(t *testing.T) {
 func TestGetCachedCertificatePKCS11(t *testing.T) {
 	tlscert := &tls.Certificate{}
 	p11cert := &pkcs11Certificate{
-		cached: unsafe.Pointer(tlscert),
+		cachedCertificate: unsafe.Pointer(tlscert),
 	}
 
 	c, err := p11cert.GetCertificate(nil)

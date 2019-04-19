@@ -31,8 +31,12 @@ import (
 type certstoreCertificate struct {
 	// Common name of keychain identity
 	commonName string
+	// Root CA bundle path
+	caBundlePath string
 	// Cached *tls.Certificate
-	cached unsafe.Pointer
+	cachedCertificate unsafe.Pointer
+	// Cached *x509.CertPool
+	cachedCertPool unsafe.Pointer
 }
 
 // SupportsKeychain returns true or false, depending on whether the
@@ -88,7 +92,7 @@ func (c *certstoreCertificate) Reload() error {
 	}
 
 	if certAndKey != nil {
-		atomic.StorePointer(&c.cached, unsafe.Pointer(certAndKey))
+		atomic.StorePointer(&c.cachedCertificate, unsafe.Pointer(certAndKey))
 		return nil
 	}
 
@@ -97,12 +101,17 @@ func (c *certstoreCertificate) Reload() error {
 
 // GetCertificate retrieves the actual underlying tls.Certificate.
 func (c *certstoreCertificate) GetCertificate(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	return (*tls.Certificate)(atomic.LoadPointer(&c.cached)), nil
+	return (*tls.Certificate)(atomic.LoadPointer(&c.cachedCertificate)), nil
 }
 
 // GetClientCertificate retrieves the actual underlying tls.Certificate.
 func (c *certstoreCertificate) GetClientCertificate(certInfo *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-	return (*tls.Certificate)(atomic.LoadPointer(&c.cached)), nil
+	return (*tls.Certificate)(atomic.LoadPointer(&c.cachedCertificate)), nil
+}
+
+// GetTrustStore returns the most up-to-date version of the trust store / CA bundle.
+func (c *certstoreCertificate) GetTrustStore() *x509.CertPool {
+	return (*x509.CertPool)(atomic.LoadPointer(&c.cachedCertPool))
 }
 
 func serializeChain(chain []*x509.Certificate) [][]byte {

@@ -18,14 +18,23 @@ package main
 
 import (
 	"crypto/tls"
-	"crypto/x509"
-	"errors"
 	"fmt"
-	"io/ioutil"
 	"strings"
 
 	"github.com/square/ghostunnel/certloader"
 )
+
+// Unsafe cipher suites available for compatibility reasons. To unlock these
+// cipher suites you must use the (hidden) --allow-unsafe-cipher-suites flag.
+// New cipher suites will be added here only if personally requested through a
+// GitHub issue, and only to work around compatibility problems with large
+// providers.
+var unsafeCipherSuites = map[string][]uint16{
+	// Needed for 'Azure Cache for Redis', see PR #239 on square/ghostunnel.
+	"UNSAFE-AZURE": {
+		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+	},
+}
 
 var cipherSuites = map[string][]uint16{
 	"AES": {
@@ -41,96 +50,87 @@ var cipherSuites = map[string][]uint16{
 }
 
 // Build reloadable certificate
-func buildCertificate(keystorePath, certPath, keyPath, keystorePass string) (certloader.Certificate, error) {
+func buildCertificate(keystorePath, certPath, keyPath, keystorePass, caBundlePath string) (certloader.Certificate, error) {
 	if hasPKCS11() {
 		if keystorePath != "" {
-			return buildCertificateFromPKCS11(keystorePath)
+			return buildCertificateFromPKCS11(keystorePath, caBundlePath)
 		} else {
-			return buildCertificateFromPKCS11(certPath)
+			return buildCertificateFromPKCS11(certPath, caBundlePath)
 		}
 	}
 	if hasKeychainIdentity() {
-		return buildCertificateFromCertstore()
+		return certloader.CertificateFromKeychainIdentity(*keychainIdentity, caBundlePath)
 	}
 	if keyPath != "" && certPath != "" {
-		return certloader.CertificateFromPEMFiles(certPath, keyPath)
+		return certloader.CertificateFromPEMFiles(certPath, keyPath, caBundlePath)
 	}
 	if keystorePath != "" {
-		return certloader.CertificateFromKeystore(keystorePath, keystorePass)
+		return certloader.CertificateFromKeystore(keystorePath, keystorePass, caBundlePath)
 	}
-	return nil, nil
+	return certloader.NoCertificate(caBundlePath)
 }
 
-func buildCertificateFromPKCS11(certificatePath string) (certloader.Certificate, error) {
-	return certloader.CertificateFromPKCS11Module(certificatePath, *pkcs11Module, *pkcs11TokenLabel, *pkcs11PIN)
+func buildCertificateFromPKCS11(certificatePath, caBundlePath string) (certloader.Certificate, error) {
+	return certloader.CertificateFromPKCS11Module(certificatePath, caBundlePath, *pkcs11Module, *pkcs11TokenLabel, *pkcs11PIN)
 }
 
 func hasPKCS11() bool {
 	return pkcs11Module != nil && *pkcs11Module != ""
 }
 
-func buildCertificateFromCertstore() (certloader.Certificate, error) {
-	return certloader.CertificateFromKeychainIdentity(*keychainIdentity)
-}
-
 func hasKeychainIdentity() bool {
 	return keychainIdentity != nil && *keychainIdentity != ""
 }
 
-func caBundle(caBundlePath string) (*x509.CertPool, error) {
-	if caBundlePath == "" {
-		return x509.SystemCertPool()
-	}
-
-	caBundleBytes, err := ioutil.ReadFile(caBundlePath)
-	if err != nil {
-		return nil, err
-	}
-
-	bundle := x509.NewCertPool()
-	ok := bundle.AppendCertsFromPEM(caBundleBytes)
-	if !ok {
-		return nil, errors.New("unable to read certificates from CA bundle")
-	}
-
-	return bundle, nil
-}
-
-// buildConfig reads command-line options and builds a tls.Config
-func buildConfig(enabledCipherSuites string, caBundlePath string) (*tls.Config, error) {
-	ca, err := caBundle(caBundlePath)
-	if err != nil {
-		return nil, err
-	}
-
+// buildConfig builds a generic tls.Config
+func buildConfig(enabledCipherSuites string) (*tls.Config, error) {
 	// List of cipher suite preferences:
 	// * We list ECDSA ahead of RSA to prefer ECDSA for multi-cert setups.
 	// * We list AES-128 ahead of AES-256 for performance reasons.
 
 	suites := []uint16{}
 	for _, suite := range strings.Split(enabledCipherSuites, ",") {
-		ciphers, ok := cipherSuites[strings.TrimSpace(suite)]
+		name := strings.TrimSpace(suite)
+		ciphers, ok := cipherSuites[name]
+		if !ok && *allowUnsafeCipherSuites {
+			ciphers, ok = unsafeCipherSuites[name]
+		}
 		if !ok {
-			return nil, fmt.Errorf("invalid cipher suite '%s' selected", suite)
+			return nil, fmt.Errorf("invalid cipher suite '%s' selected", name)
 		}
 
 		suites = append(suites, ciphers...)
 	}
 
 	return &tls.Config{
-		// Certificates
-		RootCAs:   ca,
-		ClientCAs: ca,
-
 		PreferServerCipherSuites: true,
-
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		MinVersion:   tls.VersionTLS12,
-		CipherSuites: suites,
-		CurvePreferences: []tls.CurveID{
-			// P-256/X25519 have an ASM implementation, others do not (at least on x86-64).
-			tls.X25519,
-			tls.CurveP256,
-		},
+		MinVersion:               tls.VersionTLS12,
+		CipherSuites:             suites,
 	}, nil
+}
+
+// buildClientConfig builds a tls.Config for clients
+func buildClientConfig(enabledCipherSuites string) (*tls.Config, error) {
+	// At the moment, we don't apply any extra settings on top of the generic
+	// config for client contexts
+	return buildConfig(enabledCipherSuites)
+}
+
+// buildServerConfig builds a tls.Config for servers
+func buildServerConfig(enabledCipherSuites string) (*tls.Config, error) {
+	config, err := buildConfig(enabledCipherSuites)
+	if err != nil {
+		return nil, err
+	}
+
+	// Require client cert by default
+	config.ClientAuth = tls.RequireAndVerifyClientCert
+
+	// P-256/X25519 have an ASM implementation, others do not (at least on x86-64).
+	config.CurvePreferences = []tls.CurveID{
+		tls.X25519,
+		tls.CurveP256,
+	}
+
+	return config, nil
 }

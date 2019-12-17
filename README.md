@@ -96,7 +96,7 @@ To run tests:
     make test
 
     # Option 2: run unit & integration tests in a Docker container
-    GO_VERSION=1.12.4 make docker-test
+    GO_VERSION=1.13.4 make docker-test
 
     # Open coverage information in browser
     go tool cover -html coverage-merged.out
@@ -128,9 +128,9 @@ certificate chain and private key as input (format is auto-detected). The `--cer
 `--key` flags can be used to load a certificate chain and key from separate PEM files
 (instead of a combined one).
 
-Ghostunnel also supports loading identities from the macOS keychain and having
-private keys backed by PKCS#11 modules, see the "Advanced Features" section below
-for more information.
+Ghostunnel also supports loading identities from the macOS keychain or the
+SPIFFE Workload API and having private keys backed by PKCS#11 modules, see the
+"Advanced Features" section below for more information.
 
 ### Server mode 
 
@@ -303,7 +303,24 @@ should work with any hardware security module that exposes a PKCS#11 interface.
 
 See [HSM-PKCS11](docs/HSM-PKCS11.md) for details.
 
-### PROXY protocol (experimental)
+### SPIFFE Workload API
+
+Ghostunnel has support for maintaining up-to-date, frequently rotated
+identities and trusted CA certificates from the SPIFFE Workload API.
+
+See [SPIFFE-WORKLOAD-API](docs/SPIFFE-WORKLOAD-API.md) for details.
+
+### Socket Activation (experimental)
+
+Ghostunnel supports socket activation via both systemd (on Linux) and launchd
+(on macOS). Socket activation is support for the `--listen` and `--status`
+flags, and can be used by passing an address of the form `systemd:<name>` or
+`launchd:<name>`, where `<name>` should be the name of the socket as defined in
+your systemd/launchd configuration.
+
+See [SOCKET-ACTIVATION](docs/SOCKET-ACTIVATION.md) for examples.
+
+### PROXY Protocol (experimental)
 
 Ghostunnel in server mode supports signalling of transport connection information
 to the backend using the [PROXY protocol](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt)
@@ -311,7 +328,7 @@ to the backend using the [PROXY protocol](https://www.haproxy.org/download/1.8/d
 also support the PROXY protocol and must be configured to use it when setting
 this option.
 
-### macOS keychain support (experimental)
+### MacOS Keychain Support (experimental)
 
 If ghostunnel has been compiled with build tag `certstore` (off by default,
 requires macOS 10.12+) a new flag will be available that allows for loading

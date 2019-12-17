@@ -13,7 +13,7 @@ LOCALHOST = '127.0.0.1'
 STATUS_PORT = 13100
 TIMEOUT = 5
 
-def run_ghostunnel(args, stdout=None, stderr=None):
+def run_ghostunnel(args, stdout=sys.stdout.buffer, stderr=sys.stderr.buffer, prefix=None):
     """Helper to run ghostunnel in integration test mode"""
 
     # Default shuthdown timeout to speed up tests (otherwise defaults to 5m)
@@ -21,19 +21,34 @@ def run_ghostunnel(args, stdout=None, stderr=None):
         args.append('--shutdown-timeout=5s')
 
     # Pass args through env var into integration test hook
+    os.environ["SYSTEMD_LOG_TARGET"] = "console"
+    os.environ["SYSTEMD_LOG_LEVEL"] = "debug"
     os.environ["GHOSTUNNEL_INTEGRATION_TEST"] = "true"
     os.environ["GHOSTUNNEL_INTEGRATION_ARGS"] = json.dumps(args)
 
-    # Print args for debugging
-    print_ok("running with args:\n {0}".format(' \ \n '.join(args)))
-
     # Run it, hook up stdout/stderr if desired
     test = os.path.basename(sys.argv[0]).replace('.py', '.out')
-    return Popen([
+    cmd = [
         '../ghostunnel.test',
         '-test.run=TestIntegrationMain',
-        '-test.coverprofile=coverage-{0}'.format(test)],
-        stdout=stdout, stderr=stderr)
+        '-test.coverprofile=coverage-{0}'.format(test)
+    ]
+
+    if prefix:
+        cmd = prefix + cmd
+
+    # Print cmd for debugging
+    print_ok("running:\n {0}\nwith args:\n {1}".format(' \\\n  '.join(cmd), ' \\\n  '.join(args)))
+
+    return Popen(cmd, stdout=stdout, stderr=stderr)
+
+def assert_not_zero(ghostunnel):
+    ret = ghostunnel.wait(timeout=5)
+    if ret == 0:
+        raise Exception(
+            'ghostunnel terminated with zero, but expected otherwise')
+    else:
+        print_ok("OK (terminated)")
 
 def terminate(ghostunnel):
     """Gracefully terminate ghostunnel (with timeout)"""
@@ -76,7 +91,7 @@ class RootCert:
         self.leaf_certs = []
         print_ok("generating {0}.key, {0}.crt".format(name))
         call(
-            'openssl genrsa -out {0}.key 1024'.format(name),
+            'openssl genrsa -out {0}.key 2048'.format(name),
             shell=True,
             stderr=FNULL)
         call(
@@ -90,7 +105,7 @@ class RootCert:
         fd, openssl_config = mkstemp(dir='.')
         os.write(fd, "extendedKeyUsage=clientAuth,serverAuth\n".encode('utf-8'))
         os.write(fd, "subjectAltName = {0}".format(san).encode('utf-8'))
-        call("openssl genrsa -out {0}.key 1024".format(ou),
+        call("openssl genrsa -out {0}.key 2048".format(ou),
              shell=True, stderr=FNULL)
         call(
             "openssl req -new -key {0}.key -out {0}.csr -subj /C=US/ST=CA/O=ghostunnel/OU={0}".format(ou),

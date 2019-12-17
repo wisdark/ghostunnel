@@ -22,6 +22,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"sort"
 	"sync/atomic"
 	"unsafe"
 
@@ -31,8 +32,12 @@ import (
 type certstoreCertificate struct {
 	// Common name of keychain identity
 	commonName string
+	// Root CA bundle path
+	caBundlePath string
 	// Cached *tls.Certificate
-	cached unsafe.Pointer
+	cachedCertificate unsafe.Pointer
+	// Cached *x509.CertPool
+	cachedCertPool unsafe.Pointer
 }
 
 // SupportsKeychain returns true or false, depending on whether the
@@ -43,9 +48,10 @@ func SupportsKeychain() bool {
 }
 
 // CertificateFromKeychainIdentity creates a reloadable certificate from a system keychain identity.
-func CertificateFromKeychainIdentity(commonName string) (Certificate, error) {
+func CertificateFromKeychainIdentity(commonName string, caBundlePath string) (Certificate, error) {
 	c := certstoreCertificate{
-		commonName: commonName,
+		commonName:   commonName,
+		caBundlePath: caBundlePath,
 	}
 	err := c.Reload()
 	if err != nil {
@@ -61,48 +67,85 @@ func (c *certstoreCertificate) Reload() error {
 		return err
 	}
 
-	identitites, err := store.Identities()
+	identities, err := store.Identities()
 	if err != nil {
 		return err
 	}
 
-	var certAndKey *tls.Certificate
-	for _, identity := range identitites {
+	// filter any certificates with the matching name, as the keychain allows
+	// multiple certificates with the same name
+	var candidates []certstore.Identity
+	for _, identity := range identities {
 		chain, err := identity.CertificateChain()
 		if err != nil {
 			continue
 		}
 
-		signer, err := identity.Signer()
-		if err != nil {
-			continue
-		}
-
 		if chain[0].Subject.CommonName == c.commonName {
-			certAndKey = &tls.Certificate{
-				Certificate: serializeChain(chain),
-				PrivateKey:  signer,
-			}
-			break
+			candidates = append(candidates, identity)
 		}
 	}
 
-	if certAndKey != nil {
-		atomic.StorePointer(&c.cached, unsafe.Pointer(certAndKey))
-		return nil
+	if len(candidates) == 0 {
+		return fmt.Errorf("unable to find identity with common name '%s' in keychain", c.commonName)
 	}
 
-	return fmt.Errorf("unable to find identity with common name '%s' in keychain", c.commonName)
+	// sort the candidates by descending NotAfter
+	sort.Slice(candidates, func(i, j int) bool {
+		leftChain, err := candidates[i].CertificateChain()
+		if err != nil {
+			return true
+		}
+
+		rightChain, err := candidates[j].CertificateChain()
+		if err != nil {
+			return false
+		}
+
+		return leftChain[0].NotAfter.After(rightChain[0].NotAfter)
+	})
+
+	// choose the certificate with the NotAfter furthest in the future, which is
+	// the first item after the sort
+	chosenIdentity := candidates[0]
+	chain, err := chosenIdentity.CertificateChain()
+	if err != nil {
+		return fmt.Errorf("unable to find identity with common name '%s' in keychain", c.commonName)
+	}
+	signer, err := chosenIdentity.Signer()
+	if err != nil {
+		return fmt.Errorf("unable to find identity with common name '%s' in keychain", c.commonName)
+	}
+
+	certAndKey := &tls.Certificate{
+		Leaf:        chain[0],
+		Certificate: serializeChain(chain),
+		PrivateKey:  signer,
+	}
+
+	bundle, err := LoadTrustStore(c.caBundlePath)
+	if err != nil {
+		return err
+	}
+
+	atomic.StorePointer(&c.cachedCertificate, unsafe.Pointer(certAndKey))
+	atomic.StorePointer(&c.cachedCertPool, unsafe.Pointer(bundle))
+	return nil
 }
 
 // GetCertificate retrieves the actual underlying tls.Certificate.
 func (c *certstoreCertificate) GetCertificate(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	return (*tls.Certificate)(atomic.LoadPointer(&c.cached)), nil
+	return (*tls.Certificate)(atomic.LoadPointer(&c.cachedCertificate)), nil
 }
 
 // GetClientCertificate retrieves the actual underlying tls.Certificate.
 func (c *certstoreCertificate) GetClientCertificate(certInfo *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-	return (*tls.Certificate)(atomic.LoadPointer(&c.cached)), nil
+	return (*tls.Certificate)(atomic.LoadPointer(&c.cachedCertificate)), nil
+}
+
+// GetTrustStore returns the most up-to-date version of the trust store / CA bundle.
+func (c *certstoreCertificate) GetTrustStore() *x509.CertPool {
+	return (*x509.CertPool)(atomic.LoadPointer(&c.cachedCertPool))
 }
 
 func serializeChain(chain []*x509.Certificate) [][]byte {

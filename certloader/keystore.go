@@ -24,38 +24,26 @@ import (
 	"unsafe"
 )
 
-// Certificate wraps a TLS certificate and supports reloading at runtime.
-type Certificate interface {
-	// Reload will reload the certificate and private key. Subsequent calls
-	// to GetCertificate/GetClientCertificate will return the newly loaded
-	// certificate, if reloading was successful. If reloading failed, the old
-	// state is kept.
-	Reload() error
-
-	// GetCertificate returns the current underlying certificate.
-	// Can be used for tls.Config's GetCertificate callback.
-	GetCertificate(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error)
-
-	// GetClientCertificate returns the current underlying certificate.
-	// Can be used for tls.Config's GetClientCertificate callback.
-	GetClientCertificate(certInfo *tls.CertificateRequestInfo) (*tls.Certificate, error)
-}
-
 type keystoreCertificate struct {
 	// Keystore or PEM files path
 	keystorePaths []string
 	// Password for keystore (may be empty)
 	keystorePassword string
+	// Root CA bundle path
+	caBundlePath string
 	// File format as an indicator for certigo/lib
 	format string
 	// Cached *tls.Certificate
-	cached unsafe.Pointer
+	cachedCertificate unsafe.Pointer
+	// Cached *x509.CertPool
+	cachedCertPool unsafe.Pointer
 }
 
 // CertificateFromPEMFiles creates a reloadable certificate from a set of PEM files.
-func CertificateFromPEMFiles(certificatePath, keyPath string) (Certificate, error) {
+func CertificateFromPEMFiles(certificatePath, keyPath, caBundlePath string) (Certificate, error) {
 	c := keystoreCertificate{
 		keystorePaths: []string{certificatePath, keyPath},
+		caBundlePath:  caBundlePath,
 		format:        "PEM",
 	}
 	err := c.Reload()
@@ -66,10 +54,11 @@ func CertificateFromPEMFiles(certificatePath, keyPath string) (Certificate, erro
 }
 
 // CertificateFromKeystore creates a reloadable certificate from a PKCS#12 keystore.
-func CertificateFromKeystore(keystorePath, keystorePassword string) (Certificate, error) {
+func CertificateFromKeystore(keystorePath, keystorePassword, caBundlePath string) (Certificate, error) {
 	c := keystoreCertificate{
 		keystorePaths:    []string{keystorePath},
 		keystorePassword: keystorePassword,
+		caBundlePath:     caBundlePath,
 		format:           "",
 	}
 	err := c.Reload()
@@ -105,16 +94,28 @@ func (c *keystoreCertificate) Reload() error {
 		return err
 	}
 
-	atomic.StorePointer(&c.cached, unsafe.Pointer(&certAndKey))
+	bundle, err := LoadTrustStore(c.caBundlePath)
+	if err != nil {
+		return err
+	}
+
+	atomic.StorePointer(&c.cachedCertificate, unsafe.Pointer(&certAndKey))
+	atomic.StorePointer(&c.cachedCertPool, unsafe.Pointer(bundle))
+
 	return nil
 }
 
 // GetCertificate retrieves the actual underlying tls.Certificate.
 func (c *keystoreCertificate) GetCertificate(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	return (*tls.Certificate)(atomic.LoadPointer(&c.cached)), nil
+	return (*tls.Certificate)(atomic.LoadPointer(&c.cachedCertificate)), nil
 }
 
 // GetClientCertificate retrieves the actual underlying tls.Certificate.
 func (c *keystoreCertificate) GetClientCertificate(certInfo *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-	return (*tls.Certificate)(atomic.LoadPointer(&c.cached)), nil
+	return (*tls.Certificate)(atomic.LoadPointer(&c.cachedCertificate)), nil
+}
+
+// GetTrustStore returns the most up-to-date version of the trust store / CA bundle.
+func (c *keystoreCertificate) GetTrustStore() *x509.CertPool {
+	return (*x509.CertPool)(atomic.LoadPointer(&c.cachedCertPool))
 }

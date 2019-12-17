@@ -243,7 +243,21 @@ func TestClientFlagValidation(t *testing.T) {
 	*clientDisableAuth = true
 	err = clientValidateFlags()
 	assert.NotNil(t, err, "--keystore can't be used with --disable-authentication")
+
+	*keystorePath = ""
+	*certPath = "file"
+	*keyPath = "file"
+	err = clientValidateFlags()
+	assert.NotNil(t, err, "--cert/--key can't be used with --disable-authentication")
+
+	*keystorePath = "file"
+	*certPath = "file"
+	*keyPath = "file"
 	*clientDisableAuth = false
+	err = clientValidateFlags()
+	assert.NotNil(t, err, "--keystore can't be used with --cert/--key")
+	*certPath = ""
+	*keyPath = ""
 
 	test := "test"
 	keychainIdentity = &test
@@ -270,18 +284,20 @@ func TestClientFlagValidation(t *testing.T) {
 
 func TestAllowsLocalhost(t *testing.T) {
 	*serverUnsafeTarget = false
-	assert.True(t, validateUnixOrLocalhost("localhost:1234"), "localhost should be allowed")
-	assert.True(t, validateUnixOrLocalhost("127.0.0.1:1234"), "127.0.0.1 should be allowed")
-	assert.True(t, validateUnixOrLocalhost("[::1]:1234"), "[::1] should be allowed")
-	assert.True(t, validateUnixOrLocalhost("unix:/tmp/foo"), "unix:/tmp/foo should be allowed")
+	assert.True(t, consideredSafe("localhost:1234"), "localhost should be allowed")
+	assert.True(t, consideredSafe("127.0.0.1:1234"), "127.0.0.1 should be allowed")
+	assert.True(t, consideredSafe("[::1]:1234"), "[::1] should be allowed")
+	assert.True(t, consideredSafe("unix:/tmp/foo"), "unix:/tmp/foo should be allowed")
+	assert.True(t, consideredSafe("systemd:foo"), "systemd:foo should be allowed")
+	assert.True(t, consideredSafe("launchd:foo"), "launchd:foo should be allowed")
 }
 
 func TestDisallowsFooDotCom(t *testing.T) {
 	*serverUnsafeTarget = false
-	assert.False(t, validateUnixOrLocalhost("foo.com:1234"), "foo.com should be disallowed")
-	assert.False(t, validateUnixOrLocalhost("alocalhost.com:1234"), "alocalhost.com should be disallowed")
-	assert.False(t, validateUnixOrLocalhost("localhost.com.foo.com:1234"), "localhost.com.foo.com should be disallowed")
-	assert.False(t, validateUnixOrLocalhost("74.122.190.83:1234"), "random ip address should be disallowed")
+	assert.False(t, consideredSafe("foo.com:1234"), "foo.com should be disallowed")
+	assert.False(t, consideredSafe("alocalhost.com:1234"), "alocalhost.com should be disallowed")
+	assert.False(t, consideredSafe("localhost.com.foo.com:1234"), "localhost.com.foo.com should be disallowed")
+	assert.False(t, consideredSafe("74.122.190.83:1234"), "random ip address should be disallowed")
 }
 
 func TestServerBackendDialerError(t *testing.T) {
@@ -299,36 +315,6 @@ func TestInvalidCABundle(t *testing.T) {
 		"--listen", "localhost:8080",
 	})
 	assert.NotNil(t, err, "invalid CA bundle should exit with error")
-}
-
-func TestParseUnixOrTcpAddress(t *testing.T) {
-	network, address, host, _ := parseUnixOrTCPAddress("unix:/tmp/foo")
-	if network != "unix" {
-		t.Errorf("unexpected network: %s", network)
-	}
-	if address != "/tmp/foo" {
-		t.Errorf("unexpected address: %s", address)
-	}
-	if host != "" {
-		t.Errorf("unexpected host: %s", host)
-	}
-
-	network, address, host, _ = parseUnixOrTCPAddress("localhost:8080")
-	if network != "tcp" {
-		t.Errorf("unexpected network: %s", network)
-	}
-	if address != "localhost:8080" {
-		t.Errorf("unexpected address: %s", address)
-	}
-	if host != "localhost" {
-		t.Errorf("unexpected host: %s", host)
-	}
-
-	_, _, _, err := parseUnixOrTCPAddress("localhost")
-	assert.NotNil(t, err, "was able to parse invalid host/port")
-
-	_, _, _, err = parseUnixOrTCPAddress("256.256.256.256:99999")
-	assert.NotNil(t, err, "was able to parse invalid host/port")
 }
 
 func TestProxyLoggingFlags(t *testing.T) {

@@ -124,6 +124,7 @@ func TestProxyProtocolSuccess(t *testing.T) {
 	assert.Nil(t, err, "should be able to receive connection on target")
 
 	header, err := proxyproto.Read(bufio.NewReaderSize(dst, 12))
+	assert.Nil(t, err, "should be able to read header")
 	assert.Equal(t, header, &proxyproto.Header{
 		Version:            2,
 		Command:            proxyproto.PROXY,
@@ -132,7 +133,7 @@ func TestProxyProtocolSuccess(t *testing.T) {
 		DestinationAddress: net.ParseIP("127.0.0.1").To4(),
 		SourcePort:         uint16(src.LocalAddr().(*net.TCPAddr).Port),
 		DestinationPort:    uint16(incoming.Addr().(*net.TCPAddr).Port),
-	}, "sould be able to receive proxy protocol header")
+	}, "should be able to receive proxy protocol header")
 
 	src.Write([]byte("A"))
 

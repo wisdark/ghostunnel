@@ -10,7 +10,6 @@ import sys
 
 if __name__ == "__main__":
     ghostunnel = None
-    n_clients = 10
 
     if not find_executable('systemd-socket-activate'):
         print_ok('skipping systemd socket activation test, no systemd-socket-activate binary found')
@@ -20,8 +19,6 @@ if __name__ == "__main__":
         # create certs
         root = RootCert('root')
         root.create_signed_cert('client')
-        for n in range(1, n_clients):
-            root.create_signed_cert("server{0}".format(n))
 
         # start ghostunnel
         ghostunnel = run_ghostunnel([

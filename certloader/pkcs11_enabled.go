@@ -1,4 +1,4 @@
-// +build cgo,!nopkcs11
+//go:build cgo && !nopkcs11
 
 /*-
  * Copyright 2018 Square Inc.
@@ -101,6 +101,12 @@ func (c *pkcs11Certificate) Reload() error {
 	atomic.StorePointer(&c.cachedCertPool, unsafe.Pointer(bundle))
 
 	return nil
+}
+
+// GetIdentifier returns an identifier for the certificate for logging.
+func (c *pkcs11Certificate) GetIdentifier() string {
+	cert, _ := c.GetCertificate(nil)
+	return cert.Leaf.Subject.String()
 }
 
 // GetCertificate retrieves the actual underlying tls.Certificate.

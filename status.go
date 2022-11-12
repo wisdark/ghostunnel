@@ -18,6 +18,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -26,14 +27,28 @@ import (
 	"time"
 )
 
+type statusDialer struct {
+	dial func() (net.Conn, error)
+}
+
+func (sd statusDialer) Dial(network, addr string) (net.Conn, error) {
+	return sd.dial()
+}
+
 type statusHandler struct {
 	// Mutex for locking
 	mu *sync.Mutex
-	// Backend dialer to check if target is up and running
-	dial func() (net.Conn, error)
+	// Backend dialer and HTTP client to check if target is up and running
+	// - dialer is used for raw TCP status checks
+	// - client is used for HTTP status checks if a targetAdress is supplied
+	dial          func() (net.Conn, error)
+	client        *http.Client
+	targetAddress string
 	// Current status
 	listening bool
 	reloading bool
+	// Last time we reloaded
+	lastReload time.Time
 }
 
 type statusResponse struct {
@@ -43,14 +58,20 @@ type statusResponse struct {
 	BackendStatus string    `json:"backend_status"`
 	BackendError  string    `json:"backend_error,omitempty"`
 	Time          time.Time `json:"time"`
+	LastReload    time.Time `json:"last_reload,omitempty"`
 	Hostname      string    `json:"hostname,omitempty"`
 	Message       string    `json:"message"`
 	Revision      string    `json:"revision"`
 	Compiler      string    `json:"compiler"`
 }
 
-func newStatusHandler(dial func() (net.Conn, error)) *statusHandler {
-	status := &statusHandler{&sync.Mutex{}, dial, false, false}
+func newStatusHandler(dial func() (net.Conn, error), targetAddress string) *statusHandler {
+	client := http.Client{
+		Transport: &http.Transport{
+			Dial: statusDialer{dial}.Dial,
+		},
+	}
+	status := &statusHandler{&sync.Mutex{}, dial, &client, targetAddress, false, false, time.Time{}}
 	return status
 }
 
@@ -64,24 +85,25 @@ func (s *statusHandler) Listening() {
 func (s *statusHandler) Reloading() {
 	s.mu.Lock()
 	s.reloading = true
+	s.lastReload = time.Now()
 	s.mu.Unlock()
 }
 
 func (s *statusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp := statusResponse{
 		Time: time.Now(),
+		LastReload: s.lastReload,
 	}
 
 	resp.Revision = version
 	resp.Compiler = runtime.Version()
 
-	conn, err := s.dial()
-	resp.BackendOk = err == nil
+	// Defaults. Will be overriden if checks fail.
+	resp.BackendOk = true
+	resp.BackendStatus = "ok"
 
-	if resp.BackendOk {
-		conn.Close()
-		resp.BackendStatus = "ok"
-	} else {
+	if err := s.checkBackendStatus(); err != nil {
+		resp.BackendOk = false
 		resp.BackendError = err.Error()
 		resp.BackendStatus = "critical"
 	}
@@ -117,4 +139,28 @@ func (s *statusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, _ = w.Write(out)
+}
+
+func (s *statusHandler) checkBackendStatus() error {
+	// If a targetAddress was supplied attempt a HTTP status check.
+	// Otherwise, fallback to a raw TCP status check.
+	if s.targetAddress != "" {
+		resp, err := s.client.Get(s.targetAddress)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("target returned status: %d", resp.StatusCode)
+		}
+	} else {
+		conn, err := s.dial()
+		if err != nil {
+			return err
+		}
+		conn.Close()
+	}
+
+	return nil
 }

@@ -17,18 +17,18 @@
 package auth
 
 import (
+	"context"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
+	"time"
 
+	"github.com/ghostunnel/ghostunnel/policy"
 	"github.com/ghostunnel/ghostunnel/wildcard"
+	"github.com/open-policy-agent/opa/rego"
 )
-
-// Logger is used by this package to log messages
-type Logger interface {
-	Printf(format string, v ...interface{})
-}
 
 // ACL represents an access control list for mutually-authenticated TLS connections.
 // These options are disjunctive, if at least one attribute matches access will be granted.
@@ -37,27 +37,39 @@ type ACL struct {
 	// all other options are ignored as all principals with valid certificates
 	// will be allowed no matter the subject.
 	AllowAll bool
+
 	// AllowCNs lists common names that should be allowed access. If a principal
 	// has a valid certificate with at least one of these CNs, we grant access.
 	AllowedCNs []string
+
 	// AllowOUs lists organizational units that should be allowed access. If a
 	// principal has a valid certificate with at least one of these OUs, we grant
 	// access.
 	AllowedOUs []string
+
 	// AllowDNSs lists DNS SANs that should be allowed access. If a principal
 	// has a valid certificate with at least one of these DNS SANs, we grant
 	// access.
 	AllowedDNSs []string
+
 	// AllowIPs lists IP SANs that should be allowed access. If a principal
 	// has a valid certificate with at least one of these IP SANs, we grant
 	// access.
 	AllowedIPs []net.IP
+
 	// AllowURIs lists URI SANs that should be allowed access. If a principal
 	// has a valid certificate with at least one of these URI SANs, we grant
 	// access.
 	AllowedURIs []wildcard.Matcher
-	// Logger is used to log authorization decisions.
-	Logger Logger
+
+	// AllowOPAQuery defines a rego precompiled query, ready to be verified
+	// against the client certificate. This is exclusive with all other
+	// options.
+	AllowOPAQuery policy.Policy
+
+	// OPAQueryTimeout sets the timeout for AllowOPAQuery. It has no effect
+	// if AllowOPAQuery is nil.
+	OPAQueryTimeout time.Duration
 }
 
 // VerifyPeerCertificateServer is an implementation of VerifyPeerCertificate
@@ -101,6 +113,22 @@ func (a ACL) VerifyPeerCertificateServer(rawCerts [][]byte, verifiedChains [][]*
 		return nil
 	}
 
+	// Check against OPA
+	if a.AllowOPAQuery != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), a.OPAQueryTimeout)
+		defer cancel()
+		input := map[string]interface{}{
+			"certificate": cert,
+		}
+		results, err := a.AllowOPAQuery.Eval(ctx, rego.EvalInput(input))
+		if err != nil {
+			return fmt.Errorf("unauthorized: policy returned error: %w", err)
+		}
+		if results.Allowed() {
+			return nil
+		}
+	}
+
 	return errors.New("unauthorized: invalid principal, or principal not allowed")
 }
 
@@ -116,7 +144,7 @@ func (a ACL) VerifyPeerCertificateClient(rawCerts [][]byte, verifiedChains [][]*
 
 	// If the ACL is empty, only hostname verification is performed. The hostname
 	// verification happens in crypto/tls itself, so we can skip our checks here.
-	if len(a.AllowedCNs) == 0 && len(a.AllowedOUs) == 0 && len(a.AllowedDNSs) == 0 && len(a.AllowedURIs) == 0 && len(a.AllowedIPs) == 0 {
+	if len(a.AllowedCNs) == 0 && len(a.AllowedOUs) == 0 && len(a.AllowedDNSs) == 0 && len(a.AllowedURIs) == 0 && len(a.AllowedIPs) == 0 && a.AllowOPAQuery == nil {
 		return nil
 	}
 
@@ -145,6 +173,22 @@ func (a ACL) VerifyPeerCertificateClient(rawCerts [][]byte, verifiedChains [][]*
 	// Check URI SANs against --verify-uri-san flag(s).
 	if intersectsURI(a.AllowedURIs, cert.URIs) {
 		return nil
+	}
+
+	// Check against OPA
+	if a.AllowOPAQuery != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), a.OPAQueryTimeout)
+		defer cancel()
+		input := map[string]interface{}{
+			"certificate": cert,
+		}
+		results, err := a.AllowOPAQuery.Eval(ctx, rego.EvalInput(input))
+		if err != nil {
+			return fmt.Errorf("unauthorized: policy returned error: %w", err)
+		}
+		if results.Allowed() {
+			return nil
+		}
 	}
 
 	return errors.New("unauthorized: invalid principal, or principal not allowed")

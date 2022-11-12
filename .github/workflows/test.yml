@@ -12,7 +12,7 @@ jobs:
     name: Unit tests
     strategy:
       matrix:
-        version: [1.17.x]
+        version: [1.19.x]
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
@@ -32,7 +32,7 @@ jobs:
     name: Integration tests (Linux)
     strategy:
       matrix:
-        version: [1.17]
+        version: [1.19]
         os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
@@ -52,7 +52,7 @@ jobs:
     name: Integration tests (Darwin)
     strategy:
       matrix:
-        version: [1.17.x]
+        version: [1.19.x]
         os: [macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
@@ -66,11 +66,11 @@ jobs:
         with:
           python-version: '3.x'
       - name: Install gocovmerge
-        run: go get -v github.com/wadey/gocovmerge
+        run: go install github.com/wadey/gocovmerge@latest
       - name: Check out code
         uses: actions/checkout@v2
       - name: Run tests
-        run: make test 
+        run: make test
       - name: Codecov upload
         uses: codecov/codecov-action@v1
         with:

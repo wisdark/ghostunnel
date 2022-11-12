@@ -26,33 +26,34 @@ Features
 ========
 
 **[Access control](#access-control-flags)**: Ghostunnel enforces mutual
-authentication by requiring a valid client certificate for all connections. We
-also support access control via checks on the subject (or subject alternative
-names) of a client certificate. This is useful for restricting access to
-services that don't have native access control.
+authentication by requiring a valid client certificate for all connections.
+Policies can enforce checks on the peer certificate in a connection, either
+via simple flags or declarative policies using [Open 
+Policy Agent](https://www.openpolicyagent.org). This is useful 
+for restricting access to services that don't have native access control.
 
 **[Certificate hotswapping](#certificate-hotswapping)**: Ghostunnel can reload
-certificates at runtime without dropping existing connections. Certificate
-reloading can be triggered with a signal or on a regular time interval. This
-allows short-lived certificates to be used with ghostunnel, new certificates
-will get picked up transparently. And on platforms with `SO_REUSEPORT` support,
-restarts can be done with minimal downtime.
+certificates at runtime without dropping existing connections. Certificates can
+be loaded from disk, the [SPIFFE Workload API](https://spiffe.io), or a PKCS#11 module.
+This allows short-lived certificates to be used with Ghostunnel as you can pick
+up new certificates transparently.
 
 **[ACME Support](#acme-support)**: In server mode, Ghostunnel can optionally
-obtain and automatically renew a public TLS certificate via the ACME protocol.
+obtain and automatically renew a public TLS certificate via the ACME protocol,
+such as through Let's Encrypt. Note that this requires a valid FQDN accessible
+on the public internet for verification.
 
 **[Monitoring and metrics](#metrics--profiling)**: Ghostunnel has a built-in
 status feature that can be used to collect metrics and monitor a running
-instance. Metrics can be fed into Graphite (or other systems) to see number of
+instance. Metrics can be fed into Graphite or Prometheus to see number of
 open connections, rate of new connections, connection lifetimes, timeouts, and
 other info.
 
 **[Emphasis on security](BUG-BOUNTY.md)**: We have put some thought into making
-ghostunnel secure by default and prevent accidental misconfiguration. For example, 
+Ghostunnel secure by default and prevent accidental misconfiguration. For example, 
 we always negotiate TLS v1.2 (or greater) and only use safe cipher suites. Ghostunnel
 also supports PKCS#11 which makes it possible to use Hardware Security Modules (HSMs)
-to protect private keys, and Square has a bug bounty that pays rewards for security
-findings. 
+to protect private keys. 
 
 Getting Started
 ===============
@@ -72,7 +73,7 @@ Ghostunnel is available through [GitHub releases][rel] and through [Docker Hub][
     # Compile for local architecture
     make ghostunnel
 
-Note that ghostunnel requires Go 1.17 or later to build, and CGO is required for
+Note that ghostunnel requires Go 1.19 or later to build, and CGO is required for
 PKCS#11 support.
 
 [rel]: https://github.com/ghostunnel/ghostunnel/releases
@@ -90,7 +91,7 @@ To run tests:
     make test
 
     # Option 2: run unit & integration tests in a Docker container
-    GO_VERSION=1.17 make docker-test
+    GO_VERSION=1.19 make docker-test
 
     # Open coverage information in browser
     go tool cover -html coverage-merged.out
@@ -238,6 +239,10 @@ server modes.  All checks are made against the certificate of the client or
 server. Multiple flags are treated as a logical disjunction (OR), meaning
 clients can connect as long as any of the flags matches. Ghostunnel is
 compatible with [SPIFFE][spiffe] [X.509 SVIDs][svid].
+
+Ghostunnel also has experimental support for [Open Policy
+Agent](https://www.openpolicyagent.org/) (OPA) policies. Policies can be
+reloaded at runtime much like certificates.
 
 See [ACCESS-FLAGS](docs/ACCESS-FLAGS.md) for details.
 

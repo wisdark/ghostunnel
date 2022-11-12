@@ -51,6 +51,11 @@ with `spiffe://ghostunnel/client1` or `spiffe://ghostunnel/client2` URI SANs (as
 well as other values). See documentation for the [wildcard][wildcard] package
 for more information.
 
+* `--allow-policy` and `--allow-query`
+
+Allow clients where a Rego policy evaluates to `true` with the given query.
+For more information, see the Open Policy Agent section below.
+
 * `--disable-authentication`
 
 Disables client authentication entirely, no client certificate will be required
@@ -112,6 +117,11 @@ for more information.
 
 [wildcard]: https://godoc.org/github.com/ghostunnel/ghostunnel/wildcard
 
+* `--verify-policy` and `--verify-query`
+
+Verify that a Rego policy evaluates to `true` with the given query.
+For more information, see the Open Policy Agent section below.
+
 * `--disable-authentication`
 
 Disable client authentication, no certificate will be provided to the server.
@@ -120,3 +130,106 @@ but the backend doesn't require mutual authentication.
 
 [tls]: https://golang.org/pkg/crypto/tls
 [wildcard]: https://godoc.org/github.com/ghostunnel/ghostunnel/wildcard
+
+### Open Policy Agent
+
+<span style="color:red">Note: This feature is considered experimental and is
+subject to future breaking changes. Please report bugs if you find them!</span>
+
+Ghostunnel has support for Open Policy Agent (OPA), both in server and client
+mode. The policy file must be present on disk for Ghostunnel to use it and the
+use of OPA is mutually exclusive with any other `allow` (or `verify`) flags.
+Policy files can be reloaded at runtime much like certificates, with the
+`--timed-reload` flag or via `SIGUSR1` on the latest development branch.
+
+To use it in server mode, specify the `--allow-policy` and `--allow-query` flags.
+
+Example:
+```
+ghostunnel server [...] --allow-policy=policy.rego --allow-query=data.policy.allow
+```
+
+To use it in client mode, specify the `--verify-policy` and `--verify-query` flags.
+
+Example:
+```
+ghostunnel server [...] --verify-policy=policy.rego --allow-query=data.policy.allow
+```
+
+Inside your policy, you can access the reflected X.509 peer certificate using
+`input.certificate`. For example, the policy below verifies that the presented
+client certificate contains at least one of the allowed common names or SPIFFE
+IDs.
+
+You can use the [Rego Playground](https://play.openpolicyagent.org) to test and
+develop policies. See the documentation for [x509.Certificate](https://pkg.go.dev/crypto/x509#Certificate) 
+for the structure of the `input.certificate` variable.
+
+Example ([Playground](https://play.openpolicyagent.org/p/uMcOcUkQPE)):
+```rego
+package policy
+
+import input
+
+import future.keywords.if
+import future.keywords.in
+
+default allow := false
+
+allowed_common_names = [
+	"client1",
+	"client2",
+]
+
+allowed_spiffe_ids = [
+	"example.com/client1",
+	"example.com/client1/*",
+	"example.com/client2",
+	"example.com/client2/*",
+]
+
+allow if {
+	# Allow if common name matches a pattern in allowed_common_names
+	some common_name in allowed_common_names
+	glob.match(common_name, [], input.certificate.Subject.CommonName)
+}
+
+allow if {
+	# Allow if one of the URI SANs matches a pattern in allowed_spiffe_ids
+	some uri in input.certificate.URIs
+	some spiffe_id in allowed_spiffe_ids
+
+	# Basic sanity checks for the URI SAN before we compare
+	uri.Scheme == "spiffe"
+
+	# User, query, fragment, etc. should not be set in the URI SAN
+	not uri.User
+	not uri.Opaque
+	not uri.RawQuery
+	not uri.Fragement
+	not uri.RawFragment
+
+	# Match host/path against the pattern
+	glob.match(spiffe_id, [".", "/"], sprintf("%s%s", [uri.Host, uri.Path]))
+}
+```
+
+The corresponding query for this policy is `data.policy.allow`, because we
+want to determine the outcome of the policy by looking at `allow`.
+
+See the documentation about [Golang's x509.Certificate
+struct](https://pkg.go.dev/crypto/x509#Certificate) for more about other
+properties you can match on, and the [Rego
+documentation](https://www.openpolicyagent.org/docs/latest/policy-language/)
+for more about the policy language.
+
+#### Caveats
+
+* There is no mechanism to load a policy from a remote OPA server. The policy
+  file has to be local, or be retrieved and stored locally out of band by a
+  different process.
+* By standard OPA convention, we consider a policy to be "allowed" if the query
+  is exactly one result with exactly one element that has the value `true`.
+* Policy evaluation timeout is the same as the connection timeout. If a policy
+  takes more time to execute than the specified connection timeout, the connection
+  will fail.

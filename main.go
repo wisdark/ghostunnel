@@ -30,12 +30,14 @@ import (
 	"strings"
 	"time"
 
-	graphite "github.com/cyberdelia/go-metrics-graphite"
 	"github.com/ghostunnel/ghostunnel/auth"
 	"github.com/ghostunnel/ghostunnel/certloader"
+	"github.com/ghostunnel/ghostunnel/policy"
 	"github.com/ghostunnel/ghostunnel/proxy"
 	"github.com/ghostunnel/ghostunnel/socket"
 	"github.com/ghostunnel/ghostunnel/wildcard"
+
+	graphite "github.com/cyberdelia/go-metrics-graphite"
 	gsyslog "github.com/hashicorp/go-syslog"
 	http_dialer "github.com/mwitkow/go-http-dialer"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -66,23 +68,26 @@ var (
 var (
 	app = kingpin.New("ghostunnel", "A simple SSL/TLS proxy with mutual authentication for securing non-TLS services.")
 
-	serverCommand           = app.Command("server", "Server mode (TLS listener -> plain TCP/UNIX target).")
-	serverListenAddress     = serverCommand.Flag("listen", "Address and port to listen on (can be HOST:PORT, unix:PATH, systemd:NAME or launchd:NAME).").PlaceHolder("ADDR").Required().String()
-	serverForwardAddress    = serverCommand.Flag("target", "Address to forward connections to (can be HOST:PORT or unix:PATH).").PlaceHolder("ADDR").Required().String()
-	serverProxyProtocol     = serverCommand.Flag("proxy-protocol", "Enable PROXY protocol v2 to signal connection info to backend").Bool()
-	serverUnsafeTarget      = serverCommand.Flag("unsafe-target", "If set, does not limit target to localhost, 127.0.0.1, [::1], or UNIX sockets.").Bool()
-	serverAllowAll          = serverCommand.Flag("allow-all", "Allow all clients, do not check client cert subject.").Bool()
-	serverAllowedCNs        = serverCommand.Flag("allow-cn", "Allow clients with given common name (can be repeated).").PlaceHolder("CN").Strings()
-	serverAllowedOUs        = serverCommand.Flag("allow-ou", "Allow clients with given organizational unit name (can be repeated).").PlaceHolder("OU").Strings()
-	serverAllowedDNSs       = serverCommand.Flag("allow-dns", "Allow clients with given DNS subject alternative name (can be repeated).").PlaceHolder("DNS").Strings()
-	serverAllowedIPs        = serverCommand.Flag("allow-ip", "").Hidden().PlaceHolder("SAN").IPList()
-	serverAllowedURIs       = serverCommand.Flag("allow-uri", "Allow clients with given URI subject alternative name (can be repeated).").PlaceHolder("URI").Strings()
-	serverDisableAuth       = serverCommand.Flag("disable-authentication", "Disable client authentication, no client certificate will be required.").Default("false").Bool()
-	serverAutoACMEFQDN      = serverCommand.Flag("auto-acme-cert", "Automatically obtain a certificate via ACME for the specified FQDN").PlaceHolder("www.example.com").String()
-	serverAutoACMEEmail     = serverCommand.Flag("auto-acme-email", "Email address associated with all ACME requests").PlaceHolder("admin@#example.com").String()
-	serverAutoACMEAgreedTOS = serverCommand.Flag("auto-acme-agree-to-tos", "Agree to the Terms of Service of the ACME CA").Default("false").Bool()
-	serverAutoACMEProdCA    = serverCommand.Flag("auto-acme-ca", "Specify the URL to the ACME CA. Defaults to Let's Encrypt if not specified.").PlaceHolder("https://some-acme-ca.example.com/").String()
-	serverAutoACMETestCA    = serverCommand.Flag("auto-acme-testca", "Specify the URL to the ACME CA's Test/Staging environemnt. If set, all requests will go to this CA and --auto-acme-ca will be ignored.").PlaceHolder("https://testing.some-acme-ca.example.com/").String()
+	serverCommand             = app.Command("server", "Server mode (TLS listener -> plain TCP/UNIX target).")
+	serverListenAddress       = serverCommand.Flag("listen", "Address and port to listen on (can be HOST:PORT, unix:PATH, systemd:NAME or launchd:NAME).").PlaceHolder("ADDR").Required().String()
+	serverForwardAddress      = serverCommand.Flag("target", "Address to forward connections to (can be HOST:PORT or unix:PATH).").PlaceHolder("ADDR").Required().String()
+	serverStatusTargetAddress = serverCommand.Flag("target-status", "Address to target for status checking downstream healthchecks. Defaults to a TCP healthcheck if this flag is not passed.").Default("").String()
+	serverProxyProtocol       = serverCommand.Flag("proxy-protocol", "Enable PROXY protocol v2 to signal connection info to backend").Bool()
+	serverUnsafeTarget        = serverCommand.Flag("unsafe-target", "If set, does not limit target to localhost, 127.0.0.1, [::1], or UNIX sockets.").Bool()
+	serverAllowAll            = serverCommand.Flag("allow-all", "Allow all clients, do not check client cert subject.").Bool()
+	serverAllowedCNs          = serverCommand.Flag("allow-cn", "Allow clients with given common name (can be repeated).").PlaceHolder("CN").Strings()
+	serverAllowedOUs          = serverCommand.Flag("allow-ou", "Allow clients with given organizational unit name (can be repeated).").PlaceHolder("OU").Strings()
+	serverAllowedDNSs         = serverCommand.Flag("allow-dns", "Allow clients with given DNS subject alternative name (can be repeated).").PlaceHolder("DNS").Strings()
+	serverAllowedIPs          = serverCommand.Flag("allow-ip", "").Hidden().PlaceHolder("SAN").IPList()
+	serverAllowedURIs         = serverCommand.Flag("allow-uri", "Allow clients with given URI subject alternative name (can be repeated).").PlaceHolder("URI").Strings()
+	serverAllowPolicy         = serverCommand.Flag("allow-policy", "Allow passing the location of an OPA rego file").PlaceHolder("POLICY").String()
+	serverAllowQuery          = serverCommand.Flag("allow-query", "Allow defining a query to validate against the client certificate and the rego policy.").PlaceHolder("QUERY").String()
+	serverDisableAuth         = serverCommand.Flag("disable-authentication", "Disable client authentication, no client certificate will be required.").Default("false").Bool()
+	serverAutoACMEFQDN        = serverCommand.Flag("auto-acme-cert", "Automatically obtain a certificate via ACME for the specified FQDN").PlaceHolder("FQDN").String()
+	serverAutoACMEEmail       = serverCommand.Flag("auto-acme-email", "Email address associated with all ACME requests").PlaceHolder("EMAIL").String()
+	serverAutoACMEAgreedTOS   = serverCommand.Flag("auto-acme-agree-to-tos", "Agree to the Terms of Service of the ACME CA").Default("false").Bool()
+	serverAutoACMEProdCA      = serverCommand.Flag("auto-acme-ca", "Specify the URL to the ACME CA. Defaults to Let's Encrypt if not specified.").PlaceHolder("https://some-acme-ca.example.com/").String()
+	serverAutoACMETestCA      = serverCommand.Flag("auto-acme-testca", "Specify the URL to the ACME CA's Test/Staging environemnt. If set, all requests will go to this CA and --auto-acme-ca will be ignored.").PlaceHolder("https://testing.some-acme-ca.example.com/").String()
 
 	clientCommand       = app.Command("client", "Client mode (plain TCP/UNIX listener -> TLS target).")
 	clientListenAddress = clientCommand.Flag("listen", "Address and port to listen on (can be HOST:PORT, unix:PATH, systemd:NAME or launchd:NAME).").PlaceHolder("ADDR").Required().String()
@@ -96,6 +101,8 @@ var (
 	clientAllowedDNSs    = clientCommand.Flag("verify-dns", "Allow servers with given DNS subject alternative name (can be repeated).").PlaceHolder("DNS").Strings()
 	clientAllowedIPs     = clientCommand.Flag("verify-ip", "").Hidden().PlaceHolder("SAN").IPList()
 	clientAllowedURIs    = clientCommand.Flag("verify-uri", "Allow servers with given URI subject alternative name (can be repeated).").PlaceHolder("URI").Strings()
+	clientAllowPolicy    = clientCommand.Flag("verify-policy", "Allow passing the location of an OPA rego file").PlaceHolder("POLICY").String()
+	clientAllowQuery     = clientCommand.Flag("verify-query", "Allow defining a query to validate against the client certificate and the rego policy.").PlaceHolder("QUERY").String()
 	clientDisableAuth    = clientCommand.Flag("disable-authentication", "Disable client authentication, no certificate will be provided to the server.").Default("false").Bool()
 
 	// TLS options
@@ -165,6 +172,7 @@ type Context struct {
 	dial            func() (net.Conn, error)
 	metrics         *sqmetrics.SquareMetrics
 	tlsConfigSource certloader.TLSConfigSource
+	regoPolicy      policy.Policy
 }
 
 // Dialer is an interface for dialers (either net.Dialer, or http_dialer.HttpTunnel)
@@ -210,6 +218,9 @@ func validateFlags(app *kingpin.Application) error {
 	}
 	if *metricsURL != "" && !strings.HasPrefix(*metricsURL, "http://") && !strings.HasPrefix(*metricsURL, "https://") {
 		return fmt.Errorf("--metrics-url should start with http:// or https://")
+	}
+	if *serverStatusTargetAddress != "" && !strings.HasPrefix(*serverStatusTargetAddress, "http://") && !strings.HasPrefix(*serverStatusTargetAddress, "https://") {
+		return fmt.Errorf("--target-status should start with http:// or https://")
 	}
 	if *timeoutDuration == 0 {
 		return fmt.Errorf("--connect-timeout duration must not be zero")
@@ -267,6 +278,8 @@ func serverValidateFlags() error {
 		len(*serverAllowedDNSs) > 0 ||
 		len(*serverAllowedIPs) > 0 ||
 		len(*serverAllowedURIs) > 0
+	hasOPAFlags := len(*serverAllowPolicy) > 0 ||
+		len(*serverAllowQuery) > 0
 
 	hasValidCredentials := validateCredentials([]bool{
 		// Standard keystore
@@ -292,13 +305,13 @@ func serverValidateFlags() error {
 	if (*keyPath != "" && *certPath == "") || (*certPath != "" && *keyPath == "" && !hasPKCS11()) {
 		return errors.New("--cert/--key must be set together, unless using PKCS11 for private key")
 	}
-	if !(*serverDisableAuth) && !(*serverAllowAll) && !hasAccessFlags {
-		return errors.New("at least one access control flag (--allow-{all,cn,ou,dns-san,ip-san,uri-san} or --disable-authentication) is required")
+	if !(*serverDisableAuth) && !(*serverAllowAll) && !hasAccessFlags && !hasOPAFlags {
+		return errors.New("at least one access control flag (--allow-{all,cn,ou,dns-san,ip-san,uri-san}, or OPA flags, or --disable-authentication) is required")
 	}
-	if !(*serverDisableAuth) && *serverAllowAll && hasAccessFlags {
+	if !(*serverDisableAuth) && *serverAllowAll && (hasAccessFlags || hasOPAFlags) {
 		return errors.New("--allow-all is mutually exclusive with other access control flags")
 	}
-	if *serverDisableAuth && (*serverAllowAll || hasAccessFlags) {
+	if *serverDisableAuth && (*serverAllowAll || hasAccessFlags || hasOPAFlags) {
 		return errors.New("--disable-authentication is mutually exclusive with other access control flags")
 	}
 	if !*serverUnsafeTarget && !consideredSafe(*serverForwardAddress) {
@@ -311,6 +324,13 @@ func serverValidateFlags() error {
 		if !*serverAutoACMEAgreedTOS {
 			return errors.New("--auto-acme-agree-to-tos was not specified and is required if --auto-acme-cert is specified")
 		}
+	}
+
+	if hasOPAFlags && (*serverAllowPolicy == "" || *serverAllowQuery == "") {
+		return errors.New("--allow-policy and --allow-query have to be used together")
+	}
+	if hasOPAFlags && hasAccessFlags {
+		return errors.New("--allow-policy and --allow-query are mutually exclusive with other access control flags")
 	}
 
 	if err := validateCipherSuites(); err != nil {
@@ -442,7 +462,7 @@ func run(args []string) error {
 		}
 		logger.Printf("using target address %s", *serverForwardAddress)
 
-		status := newStatusHandler(dial)
+		status := newStatusHandler(dial, *serverStatusTargetAddress)
 		context := &Context{
 			status:          status,
 			shutdownTimeout: *shutdownTimeout,
@@ -472,26 +492,35 @@ func run(args []string) error {
 			return err
 		}
 
-		network, address, host, err := socket.ParseAddress(*clientForwardAddress)
+		// Note: A target address given on the command line may not be resolvable
+		// on our side if the connection is forwarded through a CONNECT proxy. Hence,
+		// we ignore "no such host" errors when a proxy is set and trust that the
+		// proxy will be able to find the target for us.
+		skipResolve := *clientConnectProxy != nil
+		network, address, host, err := socket.ParseAddress(*clientForwardAddress, skipResolve)
 		if err != nil {
 			logger.Printf("error: invalid target address: %s\n", err)
 			return err
 		}
 		logger.Printf("using target address %s", *clientForwardAddress)
 
-		dial, err := clientBackendDialer(tlsConfigSource, network, address, host)
+		dial, policy, err := clientBackendDialer(tlsConfigSource, network, address, host)
 		if err != nil {
 			logger.Printf("error: unable to build dialer: %s\n", err)
 			return err
 		}
 
-		status := newStatusHandler(dial)
+		// NOTE: We don't provide a target status address here because this the client
+		// /_status endpoint and therefore, its target will be a ghostunnel in server
+		// mode and therefore, should be a (default) TCP check.
+		status := newStatusHandler(dial, "")
 		context := &Context{
 			status:          status,
 			shutdownTimeout: *shutdownTimeout,
 			dial:            dial,
 			metrics:         metrics,
 			tlsConfigSource: tlsConfigSource,
+			regoPolicy:      policy,
 		}
 		go context.reloadHandler(*timedReload)
 
@@ -524,14 +553,27 @@ func serverListen(context *Context) error {
 		return err
 	}
 
+	// Compile the rego policy
+	var regoPolicy policy.Policy
+	if len(*serverAllowPolicy) > 0 && len(*serverAllowQuery) > 0 {
+		regoPolicy, err = policy.LoadFromFile(*serverAllowPolicy, *serverAllowQuery)
+		if err != nil {
+			logger.Printf("Invalid rego policy or query: %s", err)
+			return err
+		}
+
+		context.regoPolicy = regoPolicy
+	}
+
 	serverACL := auth.ACL{
-		AllowAll:    *serverAllowAll,
-		AllowedCNs:  *serverAllowedCNs,
-		AllowedOUs:  *serverAllowedOUs,
-		AllowedDNSs: *serverAllowedDNSs,
-		AllowedIPs:  *serverAllowedIPs,
-		AllowedURIs: allowedURIs,
-		Logger:      logger,
+		AllowAll:        *serverAllowAll,
+		AllowedCNs:      *serverAllowedCNs,
+		AllowedOUs:      *serverAllowedOUs,
+		AllowedDNSs:     *serverAllowedDNSs,
+		AllowedIPs:      *serverAllowedIPs,
+		AllowOPAQuery:   regoPolicy,
+		AllowedURIs:     allowedURIs,
+		OPAQueryTimeout: *timeoutDuration,
 	}
 
 	if *serverDisableAuth {
@@ -649,7 +691,7 @@ func (context *Context) serveStatus() error {
 
 	https, addr := socket.ParseHTTPAddress(*statusAddress)
 
-	network, address, _, err := socket.ParseAddress(addr)
+	network, address, _, err := socket.ParseAddress(addr, false)
 	if err != nil {
 		return err
 	}
@@ -688,7 +730,7 @@ func (context *Context) serveStatus() error {
 
 // Get backend dialer function in server mode (connecting to a unix socket or tcp port)
 func serverBackendDialer() (func() (net.Conn, error), error) {
-	backendNet, backendAddr, _, err := socket.ParseAddress(*serverForwardAddress)
+	backendNet, backendAddr, _, err := socket.ParseAddress(*serverForwardAddress, false)
 	if err != nil {
 		return nil, err
 	}
@@ -699,10 +741,10 @@ func serverBackendDialer() (func() (net.Conn, error), error) {
 }
 
 // Get backend dialer function in client mode (connecting to a TLS port)
-func clientBackendDialer(tlsConfigSource certloader.TLSConfigSource, network, address, host string) (func() (net.Conn, error), error) {
+func clientBackendDialer(tlsConfigSource certloader.TLSConfigSource, network, address, host string) (func() (net.Conn, error), policy.Policy, error) {
 	config, err := buildClientConfig(*enabledCipherSuites)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if *clientServerName == "" {
@@ -714,16 +756,27 @@ func clientBackendDialer(tlsConfigSource certloader.TLSConfigSource, network, ad
 	allowedURIs, err := wildcard.CompileList(*clientAllowedURIs)
 	if err != nil {
 		logger.Printf("invalid URI pattern in --verify-uri flag (%s)", err)
-		return nil, err
+		return nil, nil, err
+	}
+
+	// Compile the rego policy
+	var regoPolicy policy.Policy
+	if len(*clientAllowPolicy) > 0 && len(*clientAllowQuery) > 0 {
+		regoPolicy, err = policy.LoadFromFile(*clientAllowPolicy, *clientAllowQuery)
+		if err != nil {
+			logger.Printf("Invalid rego policy or query: %s", err)
+			return nil, nil, err
+		}
 	}
 
 	clientACL := auth.ACL{
-		AllowedCNs:  *clientAllowedCNs,
-		AllowedOUs:  *clientAllowedOUs,
-		AllowedDNSs: *clientAllowedDNSs,
-		AllowedIPs:  *clientAllowedIPs,
-		AllowedURIs: allowedURIs,
-		Logger:      logger,
+		AllowedCNs:      *clientAllowedCNs,
+		AllowedOUs:      *clientAllowedOUs,
+		AllowedDNSs:     *clientAllowedDNSs,
+		AllowedIPs:      *clientAllowedIPs,
+		AllowedURIs:     allowedURIs,
+		AllowOPAQuery:   regoPolicy,
+		OPAQueryTimeout: *timeoutDuration,
 	}
 
 	config.VerifyPeerCertificate = clientACL.VerifyPeerCertificateClient
@@ -736,7 +789,7 @@ func clientBackendDialer(tlsConfigSource certloader.TLSConfigSource, network, ad
 		// Use HTTP CONNECT proxy to connect to target.
 		proxyConfig, err := buildClientConfig(*enabledCipherSuites)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		config.ClientAuth = tls.NoClientCert
 
@@ -744,7 +797,7 @@ func clientBackendDialer(tlsConfigSource certloader.TLSConfigSource, network, ad
 		ca, err := certloader.LoadTrustStore(*caBundlePath)
 		if err != nil {
 			logger.Printf("error: unable to build TLS config: %s\n", err)
-			return nil, err
+			return nil, nil, err
 		}
 		config.RootCAs = ca
 
@@ -756,7 +809,7 @@ func clientBackendDialer(tlsConfigSource certloader.TLSConfigSource, network, ad
 
 	clientConfig := mustGetClientConfig(tlsConfigSource, config)
 	d := certloader.DialerWithCertificate(clientConfig, *timeoutDuration, dialer)
-	return func() (net.Conn, error) { return d.Dial(network, address) }, nil
+	return func() (net.Conn, error) { return d.Dial(network, address) }, regoPolicy, nil
 }
 
 func proxyLoggerFlags(flags []string) int {

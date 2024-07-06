@@ -12,38 +12,52 @@ jobs:
     name: Build (Linux)
     strategy:
       matrix:
-        version: [1.19.x]
+        version: [1.22.x]
     runs-on: ubuntu-latest
     steps:
+      - name: Set up cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
       - name: Set up toolchain
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.version }}
         id: go
       - name: Check out code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Build binary
-        run: CGO_ENABLED=1 GOARCH=amd64 make ghostunnel
+        run: |
+          CGO_ENABLED=1 GOARCH=amd64 make ghostunnel
+          mv ghostunnel ghostunnel-linux-amd64
+          make clean
+          CGO_ENABLED=1 GOARCH=arm64 CC=aarch64-linux-gnu-gcc make ghostunnel
+          mv ghostunnel ghostunnel-linux-arm64
       - name: Upload artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: ghostunnel-linux-amd64
-          path: ghostunnel 
+          path: ghostunnel-linux-amd64
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghostunnel-linux-arm64
+          path: ghostunnel-linux-arm64
 
   build-darwin:
     name: Build (MacOS)
     strategy:
       matrix:
-        version: [1.19.x]
+        version: [1.22.x]
     runs-on: macos-latest
     steps:
       - name: Set up toolchain
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.version }}
         id: go
       - name: Check out code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Build binary
         run: |
           CGO_ENABLED=1 GOARCH=amd64 make ghostunnel
@@ -53,17 +67,17 @@ jobs:
           mv ghostunnel ghostunnel-darwin-arm64
           lipo -create -output ghostunnel-darwin-universal ghostunnel-darwin-amd64 ghostunnel-darwin-arm64
       - name: Upload artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: ghostunnel-darwin-amd64
           path: ghostunnel-darwin-amd64
       - name: Upload artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: ghostunnel-darwin-arm64
           path: ghostunnel-darwin-arm64
       - name: Upload artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: ghostunnel-darwin-universal
           path: ghostunnel-darwin-universal
@@ -72,20 +86,20 @@ jobs:
     name: Build (Windows)
     strategy:
       matrix:
-        version: [1.19.x]
+        version: [1.22.x]
     runs-on: windows-latest
     steps:
       - name: Set up toolchain
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.version }}
         id: go
       - name: Check out code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Build binary
         run: make ghostunnel
       - name: Upload artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: ghostunnel-windows-amd64
-          path: ghostunnel 
+          path: ghostunnel

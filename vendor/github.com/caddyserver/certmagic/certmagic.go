@@ -39,14 +39,19 @@ import (
 	"crypto"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // HTTPS serves mux for all domainNames using the HTTP
@@ -264,9 +269,18 @@ type OnDemandConfig struct {
 	// whether a certificate can be obtained or renewed
 	// for the given name. If an error is returned, the
 	// request will be denied.
-	DecisionFunc func(name string) error
+	DecisionFunc func(ctx context.Context, name string) error
 
-	// List of whitelisted hostnames (SNI values) for
+	// Sources for getting new, unmanaged certificates.
+	// They will be invoked only during TLS handshakes
+	// before on-demand certificate management occurs,
+	// for certificates that are not already loaded into
+	// the in-memory cache.
+	//
+	// TODO: EXPERIMENTAL: subject to change and/or removal.
+	Managers []Manager
+
+	// List of allowed hostnames (SNI values) for
 	// deferred (on-demand) obtaining of certificates.
 	// Used only by higher-level functions in this
 	// package to persist the list of hostnames that
@@ -278,66 +292,15 @@ type OnDemandConfig struct {
 	// for higher-level convenience functions to be
 	// able to retain their convenience (alternative
 	// is: the user manually creates a DecisionFunc
-	// that whitelists the same names it already
-	// passed into Manage) and without letting clients
-	// have their run of any domain names they want.
-	// Only enforced if len > 0.
-	hostWhitelist []string
-}
-
-func (o *OnDemandConfig) whitelistContains(name string) bool {
-	for _, n := range o.hostWhitelist {
-		if strings.EqualFold(n, name) {
-			return true
-		}
-	}
-	return false
-}
-
-// isLoopback returns true if the hostname of addr looks
-// explicitly like a common local hostname. addr must only
-// be a host or a host:port combination.
-func isLoopback(addr string) bool {
-	host := hostOnly(addr)
-	return host == "localhost" ||
-		strings.Trim(host, "[]") == "::1" ||
-		strings.HasPrefix(host, "127.")
-}
-
-// isInternal returns true if the IP of addr
-// belongs to a private network IP range. addr
-// must only be an IP or an IP:port combination.
-// Loopback addresses are considered false.
-func isInternal(addr string) bool {
-	privateNetworks := []string{
-		"10.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-		"fc00::/7",
-	}
-	host := hostOnly(addr)
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return false
-	}
-	for _, privateNetwork := range privateNetworks {
-		_, ipnet, _ := net.ParseCIDR(privateNetwork)
-		if ipnet.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
-// hostOnly returns only the host portion of hostport.
-// If there is no port or if there is an error splitting
-// the port off, the whole input string is returned.
-func hostOnly(hostport string) string {
-	host, _, err := net.SplitHostPort(hostport)
-	if err != nil {
-		return hostport // OK; probably had no port to begin with
-	}
-	return host
+	// that allows the same names it already passed
+	// into Manage) and without letting clients have
+	// their run of any domain names they want.
+	// Only enforced if len > 0. (This is a map to
+	// avoid O(n^2) performance; when it was a slice,
+	// we saw a 30s CPU profile for a config managing
+	// 110K names where 29s was spent checking for
+	// duplicates. Order is not important here.)
+	hostAllowlist map[string]struct{}
 }
 
 // PreChecker is an interface that can be optionally implemented by
@@ -386,7 +349,12 @@ type Revoker interface {
 type Manager interface {
 	// GetCertificate returns the certificate to use to complete the handshake.
 	// Since this is called during every TLS handshake, it must be very fast and not block.
-	// Returning (nil, nil) is valid and is simply treated as a no-op.
+	// Returning any non-nil value indicates that this Manager manages a certificate
+	// for the described handshake. Returning (nil, nil) is valid and is simply treated as
+	// a no-op Return (nil, nil) when the Manager has no certificate for this handshake.
+	// Return an error or a certificate only if the Manager is supposed to get a certificate
+	// for this handshake. Returning (nil, nil) other Managers or Issuers to try to get
+	// a certificate for the handshake.
 	GetCertificate(context.Context, *tls.ClientHelloInfo) (*tls.Certificate, error)
 }
 
@@ -398,14 +366,32 @@ type KeyGenerator interface {
 	GenerateKey() (crypto.PrivateKey, error)
 }
 
+// IssuerPolicy is a type that enumerates how to
+// choose which issuer to use. EXPERIMENTAL and
+// subject to change.
+type IssuerPolicy string
+
+// Supported issuer policies. These are subject to change.
+const (
+	// UseFirstIssuer uses the first issuer that
+	// successfully returns a certificate.
+	UseFirstIssuer = "first"
+
+	// UseFirstRandomIssuer shuffles the list of
+	// configured issuers, then uses the first one
+	// that successfully returns a certificate.
+	UseFirstRandomIssuer = "first_random"
+)
+
 // IssuedCertificate represents a certificate that was just issued.
 type IssuedCertificate struct {
 	// The PEM-encoding of DER-encoded ASN.1 data.
 	Certificate []byte
 
 	// Any extra information to serialize alongside the
-	// certificate in storage.
-	Metadata interface{}
+	// certificate in storage. It MUST be serializable
+	// as JSON in order to be preserved.
+	Metadata any
 }
 
 // CertificateResource associates a certificate with its private
@@ -425,11 +411,11 @@ type CertificateResource struct {
 
 	// Any extra information associated with the certificate,
 	// usually provided by the issuer implementation.
-	IssuerData interface{} `json:"issuer_data,omitempty"`
+	IssuerData json.RawMessage `json:"issuer_data,omitempty"`
 
 	// The unique string identifying the issuer of the
 	// certificate; internally useful for storage access.
-	issuerKey string `json:"-"`
+	issuerKey string
 }
 
 // NamesKey returns the list of SANs as a single string,
@@ -468,7 +454,15 @@ var Default = Config{
 	RenewalWindowRatio: DefaultRenewalWindowRatio,
 	Storage:            defaultFileStorage,
 	KeySource:          DefaultKeyGenerator,
+	Logger:             defaultLogger,
 }
+
+// defaultLogger is guaranteed to be a non-nil fallback logger.
+var defaultLogger = zap.New(zapcore.NewCore(
+	zapcore.NewConsoleEncoder(zap.NewProductionEncoderConfig()),
+	os.Stderr,
+	zap.InfoLevel,
+))
 
 const (
 	// HTTPChallengePort is the officially-designated port for

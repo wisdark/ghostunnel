@@ -24,17 +24,19 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io/fs"
 	weakrand "math/rand"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
-	"github.com/mholt/acmez"
-	"github.com/mholt/acmez/acme"
+	"github.com/mholt/acmez/v2"
+	"github.com/mholt/acmez/v2/acme"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/ocsp"
 	"golang.org/x/net/idna"
@@ -50,18 +52,35 @@ type Config struct {
 	// it should be renewed; for most certificates, the
 	// global default is good, but for extremely short-
 	// lived certs, you may want to raise this to ~0.5.
+	// Ratio is remaining:total lifetime.
 	RenewalWindowRatio float64
 
 	// An optional event callback clients can set
 	// to subscribe to certain things happening
 	// internally by this config; invocations are
 	// synchronous, so make them return quickly!
-	OnEvent func(event string, data interface{})
+	// Functions should honor context cancellation.
+	//
+	// An error should only be returned to advise
+	// the emitter to abort or cancel an upcoming
+	// event. Some events, especially those that have
+	// already happened, cannot be aborted. For example,
+	// cert_obtaining can be canceled, but
+	// cert_obtained cannot. Emitters may choose to
+	// ignore returned errors.
+	OnEvent func(ctx context.Context, event string, data map[string]any) error
 
 	// DefaultServerName specifies a server name
 	// to use when choosing a certificate if the
 	// ClientHello's ServerName field is empty.
 	DefaultServerName string
+
+	// FallbackServerName specifies a server name
+	// to use when choosing a certificate if the
+	// ClientHello's ServerName field doesn't match
+	// any available certificate.
+	// EXPERIMENTAL: Subject to change or removal.
+	FallbackServerName string
 
 	// The state needed to operate on-demand TLS;
 	// if non-nil, on-demand TLS is enabled and
@@ -79,14 +98,16 @@ type Config struct {
 	// turn until one succeeds.
 	Issuers []Issuer
 
-	// Sources for getting new, unmanaged certificates.
-	// They will be invoked only during TLS handshakes
-	// before on-demand certificate management occurs,
-	// for certificates that are not already loaded into
-	// the in-memory cache.
-	//
-	// TODO: EXPERIMENTAL: subject to change and/or removal.
-	Managers []Manager
+	// How to select which issuer to use.
+	// Default: UseFirstIssuer (subject to change).
+	IssuerPolicy IssuerPolicy
+
+	// If true, private keys already existing in storage
+	// will be reused. Otherwise, a new key will be
+	// created for every new certificate to mitigate
+	// pinning and reduce the scope of key compromise.
+	// Default: false (do not reuse keys).
+	ReusePrivateKeys bool
 
 	// The source of new private keys for certificates;
 	// the default KeySource is StandardKeyGenerator.
@@ -110,7 +131,26 @@ type Config struct {
 	// TLS assets. Default is the local file system.
 	Storage Storage
 
-	// Set a logger to enable logging.
+	// CertMagic will verify the storage configuration
+	// is acceptable before obtaining a certificate
+	// to avoid information loss after an expensive
+	// operation. If you are absolutely 100% sure your
+	// storage is properly configured and has sufficient
+	// space, you can disable this check to reduce I/O
+	// if that is expensive for you.
+	// EXPERIMENTAL: Subject to change or removal.
+	DisableStorageCheck bool
+
+	// SubjectTransformer is a hook that can transform the
+	// subject (SAN) of a certificate being loaded or issued.
+	// For example, a common use case is to replace the
+	// left-most label with an asterisk (*) to become a
+	// wildcard certificate.
+	// EXPERIMENTAL: Subject to change or removal.
+	SubjectTransformer func(ctx context.Context, domain string) string
+
+	// Set a logger to enable logging. If not set,
+	// a default logger will be created.
 	Logger *zap.Logger
 
 	// required pointer to the in-memory cert cache
@@ -152,6 +192,7 @@ func NewDefault() *Config {
 			GetConfigForCert: func(Certificate) (*Config, error) {
 				return NewDefault(), nil
 			},
+			Logger: Default.Logger,
 		})
 	}
 	certCache := defaultCache
@@ -179,7 +220,10 @@ func New(certCache *Cache, cfg Config) *Config {
 	if certCache == nil {
 		panic("a certificate cache is required")
 	}
-	if certCache.options.GetConfigForCert == nil {
+	certCache.optionsMu.RLock()
+	getConfigForCert := certCache.options.GetConfigForCert
+	defer certCache.optionsMu.RUnlock()
+	if getConfigForCert == nil {
 		panic("cache must have GetConfigForCert set in its options")
 	}
 	return newWithCache(certCache, cfg)
@@ -196,6 +240,16 @@ func newWithCache(certCache *Cache, cfg Config) *Config {
 	if cfg.OnDemand == nil {
 		cfg.OnDemand = Default.OnDemand
 	}
+	if !cfg.MustStaple {
+		cfg.MustStaple = Default.MustStaple
+	}
+	if cfg.Issuers == nil {
+		cfg.Issuers = Default.Issuers
+		if cfg.Issuers == nil {
+			// at least one issuer is absolutely required if not nil
+			cfg.Issuers = []Issuer{NewACMEIssuer(&cfg, DefaultACME)}
+		}
+	}
 	if cfg.RenewalWindowRatio == 0 {
 		cfg.RenewalWindowRatio = Default.RenewalWindowRatio
 	}
@@ -208,18 +262,14 @@ func newWithCache(certCache *Cache, cfg Config) *Config {
 	if cfg.DefaultServerName == "" {
 		cfg.DefaultServerName = Default.DefaultServerName
 	}
-	if !cfg.MustStaple {
-		cfg.MustStaple = Default.MustStaple
+	if cfg.FallbackServerName == "" {
+		cfg.FallbackServerName = Default.FallbackServerName
 	}
 	if cfg.Storage == nil {
 		cfg.Storage = Default.Storage
 	}
-	if len(cfg.Issuers) == 0 {
-		cfg.Issuers = Default.Issuers
-		if len(cfg.Issuers) == 0 {
-			// at least one issuer is absolutely required
-			cfg.Issuers = []Issuer{NewACMEIssuer(&cfg, DefaultACME)}
-		}
+	if cfg.Logger == nil {
+		cfg.Logger = Default.Logger
 	}
 
 	// absolutely don't allow a nil storage,
@@ -229,6 +279,12 @@ func newWithCache(certCache *Cache, cfg Config) *Config {
 		cfg.Storage = defaultFileStorage
 	}
 
+	// absolutely don't allow a nil logger either,
+	// because that would result in panics
+	if cfg.Logger == nil {
+		cfg.Logger = defaultLogger
+	}
+
 	cfg.certCache = certCache
 
 	return &cfg
@@ -236,17 +292,20 @@ func newWithCache(certCache *Cache, cfg Config) *Config {
 
 // ManageSync causes the certificates for domainNames to be managed
 // according to cfg. If cfg.OnDemand is not nil, then this simply
-// whitelists the domain names and defers the certificate operations
+// allowlists the domain names and defers the certificate operations
 // to when they are needed. Otherwise, the certificates for each
-// name are loaded from storage or obtained from the CA. If loaded
-// from storage, they are renewed if they are expiring or expired.
-// It then caches the certificate in memory and is prepared to serve
-// them up during TLS handshakes.
+// name are loaded from storage or obtained from the CA if not already
+// in the cache associated with the Config. If loaded from storage,
+// they are renewed if they are expiring or expired. It then caches
+// the certificate in memory and is prepared to serve them up during
+// TLS handshakes. To change how an already-loaded certificate is
+// managed, update the cache options relating to getting a config for
+// a cert.
 //
-// Note that name whitelisting for on-demand management only takes
+// Note that name allowlisting for on-demand management only takes
 // effect if cfg.OnDemand.DecisionFunc is not set (is nil); it will
 // not overwrite an existing DecisionFunc, nor will it overwrite
-// its decision; i.e. the implicit whitelist is only used if no
+// its decision; i.e. the implicit allowlist is only used if no
 // DecisionFunc is set.
 //
 // This method is synchronous, meaning that certificates for all
@@ -306,16 +365,18 @@ func (cfg *Config) manageAll(ctx context.Context, domainNames []string, async bo
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if cfg.OnDemand != nil && cfg.OnDemand.hostAllowlist == nil {
+		cfg.OnDemand.hostAllowlist = make(map[string]struct{})
+	}
 
 	for _, domainName := range domainNames {
 		// if on-demand is configured, defer obtain and renew operations
 		if cfg.OnDemand != nil {
-			if !cfg.OnDemand.whitelistContains(domainName) {
-				cfg.OnDemand.hostWhitelist = append(cfg.OnDemand.hostWhitelist, domainName)
-			}
+			cfg.OnDemand.hostAllowlist[normalizedName(domainName)] = struct{}{}
 			continue
 		}
 
+		// TODO: consider doing this in a goroutine if async, to utilize multiple cores while loading certs
 		// otherwise, begin management immediately
 		err := cfg.manageOne(ctx, domainName, async)
 		if err != nil {
@@ -327,6 +388,14 @@ func (cfg *Config) manageAll(ctx context.Context, domainNames []string, async bo
 }
 
 func (cfg *Config) manageOne(ctx context.Context, domainName string, async bool) error {
+	// if certificate is already being managed, nothing to do; maintenance will continue
+	certs := cfg.certCache.getAllMatchingCerts(domainName)
+	for _, cert := range certs {
+		if cert.managed {
+			return nil
+		}
+	}
+
 	// first try loading existing certificate from storage
 	cert, err := cfg.CacheManagedCertificate(ctx, domainName)
 	if err != nil {
@@ -378,6 +447,15 @@ func (cfg *Config) manageOne(ctx context.Context, domainName string, async bool)
 			return err
 		}
 
+		// ensure ARI is updated before we check whether the cert needs renewing
+		// (we ignore the second return value because we already check if needs renewing anyway)
+		if cert.ari.NeedsRefresh() {
+			cert, _, err = cfg.updateARI(ctx, cert, cfg.Logger)
+			if err != nil {
+				cfg.Logger.Error("updating ARI upon managing", zap.Error(err))
+			}
+		}
+
 		// otherwise, simply renew the certificate if needed
 		if cert.NeedsRenewal(cfg) {
 			var err error
@@ -406,28 +484,6 @@ func (cfg *Config) manageOne(ctx context.Context, domainName string, async bool)
 	return renew()
 }
 
-// Unmanage causes the certificates for domainNames to stop being managed.
-// If there are certificates for the supplied domain names in the cache, they
-// are evicted from the cache.
-func (cfg *Config) Unmanage(domainNames []string) {
-	var deleteQueue []Certificate
-	for _, domainName := range domainNames {
-		certs := cfg.certCache.AllMatchingCertificates(domainName)
-		for _, cert := range certs {
-			if !cert.managed {
-				continue
-			}
-			deleteQueue = append(deleteQueue, cert)
-		}
-	}
-
-	cfg.certCache.mu.Lock()
-	for _, cert := range deleteQueue {
-		cfg.certCache.removeCertificate(cert)
-	}
-	cfg.certCache.mu.Unlock()
-}
-
 // ObtainCertSync generates a new private key and obtains a certificate for
 // name using cfg in the foreground; i.e. interactively and without retries.
 // It stows the renewed certificate and its assets in storage if successful.
@@ -448,6 +504,10 @@ func (cfg *Config) obtainCert(ctx context.Context, name string, interactive bool
 		return fmt.Errorf("no issuers configured; impossible to obtain or check for existing certificate in storage")
 	}
 
+	log := cfg.Logger.Named("obtain")
+
+	name = cfg.transformSubject(ctx, log, name)
+
 	// if storage has all resources for this certificate, obtain is a no-op
 	if cfg.storageHasCertResourcesAnyIssuer(ctx, name) {
 		return nil
@@ -460,11 +520,7 @@ func (cfg *Config) obtainCert(ctx context.Context, name string, interactive bool
 		return fmt.Errorf("failed storage check: %v - storage is probably misconfigured", err)
 	}
 
-	log := loggerNamed(cfg.Logger, "obtain")
-
-	if log != nil {
-		log.Info("acquiring lock", zap.String("identifier", name))
-	}
+	log.Info("acquiring lock", zap.String("identifier", name))
 
 	// ensure idempotency of the obtain operation for this name
 	lockKey := cfg.lockKey(certIssueLockOp, name)
@@ -473,36 +529,48 @@ func (cfg *Config) obtainCert(ctx context.Context, name string, interactive bool
 		return fmt.Errorf("unable to acquire lock '%s': %v", lockKey, err)
 	}
 	defer func() {
-		if log != nil {
-			log.Info("releasing lock", zap.String("identifier", name))
-		}
+		log.Info("releasing lock", zap.String("identifier", name))
 		if err := releaseLock(ctx, cfg.Storage, lockKey); err != nil {
-			if log != nil {
-				log.Error("unable to unlock",
-					zap.String("identifier", name),
-					zap.String("lock_key", lockKey),
-					zap.Error(err))
-			}
+			log.Error("unable to unlock",
+				zap.String("identifier", name),
+				zap.String("lock_key", lockKey),
+				zap.Error(err))
 		}
 	}()
-	if log != nil {
-		log.Info("lock acquired", zap.String("identifier", name))
-	}
+	log.Info("lock acquired", zap.String("identifier", name))
 
 	f := func(ctx context.Context) error {
 		// check if obtain is still needed -- might have been obtained during lock
 		if cfg.storageHasCertResourcesAnyIssuer(ctx, name) {
-			if log != nil {
-				log.Info("certificate already exists in storage", zap.String("identifier", name))
-			}
+			log.Info("certificate already exists in storage", zap.String("identifier", name))
 			return nil
 		}
 
-		// if storage has a private key already, use it; otherwise,
-		// we'll generate our own
-		privKey, privKeyPEM, issuers, err := cfg.reusePrivateKey(ctx, name)
-		if err != nil {
-			return err
+		log.Info("obtaining certificate", zap.String("identifier", name))
+
+		if err := cfg.emit(ctx, "cert_obtaining", map[string]any{"identifier": name}); err != nil {
+			return fmt.Errorf("obtaining certificate aborted by event handler: %w", err)
+		}
+
+		// If storage has a private key already, use it; otherwise we'll generate our own.
+		// Also create the slice of issuers we will try using according to any issuer
+		// selection policy (it must be a copy of the slice so we don't mutate original).
+		var privKey crypto.PrivateKey
+		var privKeyPEM []byte
+		var issuers []Issuer
+		if cfg.ReusePrivateKeys {
+			privKey, privKeyPEM, issuers, err = cfg.reusePrivateKey(ctx, name)
+			if err != nil {
+				return err
+			}
+		} else {
+			issuers = make([]Issuer, len(cfg.Issuers))
+			copy(issuers, cfg.Issuers)
+		}
+		if cfg.IssuerPolicy == UseFirstRandomIssuer {
+			weakrand.Shuffle(len(issuers), func(i, j int) {
+				issuers[i], issuers[j] = issuers[j], issuers[i]
+			})
 		}
 		if privKey == nil {
 			privKey, err = cfg.KeySource.GenerateKey()
@@ -515,7 +583,7 @@ func (cfg *Config) obtainCert(ctx context.Context, name string, interactive bool
 			}
 		}
 
-		csr, err := cfg.generateCSR(privKey, []string{name})
+		csr, err := cfg.generateCSR(privKey, []string{name}, false)
 		if err != nil {
 			return err
 		}
@@ -523,11 +591,12 @@ func (cfg *Config) obtainCert(ctx context.Context, name string, interactive bool
 		// try to obtain from each issuer until we succeed
 		var issuedCert *IssuedCertificate
 		var issuerUsed Issuer
+		var issuerKeys []string
 		for i, issuer := range issuers {
-			if log != nil {
-				log.Debug(fmt.Sprintf("trying issuer %d/%d", i+1, len(cfg.Issuers)),
-					zap.String("issuer", issuer.IssuerKey()))
-			}
+			issuerKeys = append(issuerKeys, issuer.IssuerKey())
+
+			log.Debug(fmt.Sprintf("trying issuer %d/%d", i+1, len(cfg.Issuers)),
+				zap.String("issuer", issuer.IssuerKey()))
 
 			if prechecker, ok := issuer.(PreChecker); ok {
 				err = prechecker.PreCheck(ctx, []string{name}, interactive)
@@ -536,7 +605,19 @@ func (cfg *Config) obtainCert(ctx context.Context, name string, interactive bool
 				}
 			}
 
-			issuedCert, err = issuer.Issue(ctx, csr)
+			// TODO: ZeroSSL's API currently requires CommonName to be set, and requires it be
+			// distinct from SANs. If this was a cert it would violate the BRs, but their certs
+			// are compliant, so their CSR requirements just needlessly add friction, complexity,
+			// and inefficiency for clients. CommonName has been deprecated for 25+ years.
+			useCSR := csr
+			if issuer.IssuerKey() == zerosslIssuerKey {
+				useCSR, err = cfg.generateCSR(privKey, []string{name}, true)
+				if err != nil {
+					return err
+				}
+			}
+
+			issuedCert, err = issuer.Issue(ctx, useCSR)
 			if err == nil {
 				issuerUsed = issuer
 				break
@@ -549,39 +630,60 @@ func (cfg *Config) obtainCert(ctx context.Context, name string, interactive bool
 			if errors.As(err, &problem) {
 				errToLog = problem
 			}
-			if log != nil {
-				log.Error("could not get certificate from issuer",
-					zap.String("identifier", name),
-					zap.String("issuer", issuer.IssuerKey()),
-					zap.Error(errToLog))
-			}
+			log.Error("could not get certificate from issuer",
+				zap.String("identifier", name),
+				zap.String("issuer", issuer.IssuerKey()),
+				zap.Error(errToLog))
 		}
 		if err != nil {
+			cfg.emit(ctx, "cert_failed", map[string]any{
+				"renewal":    false,
+				"identifier": name,
+				"issuers":    issuerKeys,
+				"error":      err,
+			})
+
 			// only the error from the last issuer will be returned, but we logged the others
 			return fmt.Errorf("[%s] Obtain: %w", name, err)
 		}
+		issuerKey := issuerUsed.IssuerKey()
 
 		// success - immediately save the certificate resource
+		metaJSON, err := json.Marshal(issuedCert.Metadata)
+		if err != nil {
+			log.Error("unable to encode certificate metadata", zap.Error(err))
+		}
 		certRes := CertificateResource{
 			SANs:           namesFromCSR(csr),
 			CertificatePEM: issuedCert.Certificate,
 			PrivateKeyPEM:  privKeyPEM,
-			IssuerData:     issuedCert.Metadata,
+			IssuerData:     metaJSON,
+			issuerKey:      issuerUsed.IssuerKey(),
 		}
 		err = cfg.saveCertResource(ctx, issuerUsed, certRes)
 		if err != nil {
 			return fmt.Errorf("[%s] Obtain: saving assets: %v", name, err)
 		}
 
-		cfg.emit("cert_obtained", CertificateEventData{
-			Name:       name,
-			IssuerKey:  issuerUsed.IssuerKey(),
-			StorageKey: certRes.NamesKey(),
-		})
+		log.Info("certificate obtained successfully",
+			zap.String("identifier", name),
+			zap.String("issuer", issuerUsed.IssuerKey()))
 
-		if log != nil {
-			log.Info("certificate obtained successfully", zap.String("identifier", name))
-		}
+		certKey := certRes.NamesKey()
+
+		cfg.emit(ctx, "cert_obtained", map[string]any{
+			"renewal":          false,
+			"identifier":       name,
+			"issuer":           issuerUsed.IssuerKey(),
+			"storage_path":     StorageKeys.CertsSitePrefix(issuerKey, certKey),
+			"private_key_path": StorageKeys.SitePrivateKey(issuerKey, certKey),
+			"certificate_path": StorageKeys.SiteCert(issuerKey, certKey),
+			"metadata_path":    StorageKeys.SiteMeta(issuerKey, certKey),
+			"csr_pem": pem.EncodeToMemory(&pem.Block{
+				Type:  "CERTIFICATE REQUEST",
+				Bytes: csr.Raw,
+			}),
+		})
 
 		return nil
 	}
@@ -650,9 +752,6 @@ func (cfg *Config) storageHasCertResourcesAnyIssuer(ctx context.Context, name st
 // and its assets in storage if successful. It DOES NOT update the in-memory
 // cache with the new certificate. The certificate will not be renewed if it
 // is not close to expiring unless force is true.
-//
-// Renewing a certificate is the same as obtaining a certificate, except that
-// the existing private key already in storage is reused.
 func (cfg *Config) RenewCertSync(ctx context.Context, name string, force bool) error {
 	return cfg.renewCert(ctx, name, force, true)
 }
@@ -668,6 +767,10 @@ func (cfg *Config) renewCert(ctx context.Context, name string, force, interactiv
 		return fmt.Errorf("no issuers configured; impossible to renew or check existing certificate in storage")
 	}
 
+	log := cfg.Logger.Named("renew")
+
+	name = cfg.transformSubject(ctx, log, name)
+
 	// ensure storage is writeable and readable
 	// TODO: this is not necessary every time; should only perform check once every so often for each storage, which may require some global state...
 	err := cfg.checkStorage(ctx)
@@ -675,11 +778,7 @@ func (cfg *Config) renewCert(ctx context.Context, name string, force, interactiv
 		return fmt.Errorf("failed storage check: %v - storage is probably misconfigured", err)
 	}
 
-	log := loggerNamed(cfg.Logger, "renew")
-
-	if log != nil {
-		log.Info("acquiring lock", zap.String("identifier", name))
-	}
+	log.Info("acquiring lock", zap.String("identifier", name))
 
 	// ensure idempotency of the renew operation for this name
 	lockKey := cfg.lockKey(certIssueLockOp, name)
@@ -688,21 +787,16 @@ func (cfg *Config) renewCert(ctx context.Context, name string, force, interactiv
 		return fmt.Errorf("unable to acquire lock '%s': %v", lockKey, err)
 	}
 	defer func() {
-		if log != nil {
-			log.Info("releasing lock", zap.String("identifier", name))
-		}
+		log.Info("releasing lock", zap.String("identifier", name))
+
 		if err := releaseLock(ctx, cfg.Storage, lockKey); err != nil {
-			if log != nil {
-				log.Error("unable to unlock",
-					zap.String("identifier", name),
-					zap.String("lock_key", lockKey),
-					zap.Error(err))
-			}
+			log.Error("unable to unlock",
+				zap.String("identifier", name),
+				zap.String("lock_key", lockKey),
+				zap.Error(err))
 		}
 	}()
-	if log != nil {
-		log.Info("lock acquired", zap.String("identifier", name))
-	}
+	log.Info("lock acquired", zap.String("identifier", name))
 
 	f := func(ctx context.Context) error {
 		// prepare for renewal (load PEM cert, key, and meta)
@@ -712,35 +806,54 @@ func (cfg *Config) renewCert(ctx context.Context, name string, force, interactiv
 		}
 
 		// check if renew is still needed - might have been renewed while waiting for lock
-		timeLeft, needsRenew := cfg.managedCertNeedsRenewal(certRes)
+		timeLeft, leaf, needsRenew := cfg.managedCertNeedsRenewal(certRes, false)
 		if !needsRenew {
 			if force {
-				if log != nil {
-					log.Info("certificate does not need to be renewed, but renewal is being forced",
-						zap.String("identifier", name),
-						zap.Duration("remaining", timeLeft))
-				}
+				log.Info("certificate does not need to be renewed, but renewal is being forced",
+					zap.String("identifier", name),
+					zap.Duration("remaining", timeLeft))
 			} else {
-				if log != nil {
-					log.Info("certificate appears to have been renewed already",
-						zap.String("identifier", name),
-						zap.Duration("remaining", timeLeft))
-				}
+				log.Info("certificate appears to have been renewed already",
+					zap.String("identifier", name),
+					zap.Duration("remaining", timeLeft))
 				return nil
 			}
 		}
 
-		if log != nil {
-			log.Info("renewing certificate",
-				zap.String("identifier", name),
-				zap.Duration("remaining", timeLeft))
+		log.Info("renewing certificate",
+			zap.String("identifier", name),
+			zap.Duration("remaining", timeLeft))
+
+		if err := cfg.emit(ctx, "cert_obtaining", map[string]any{
+			"renewal":    true,
+			"identifier": name,
+			"forced":     force,
+			"remaining":  timeLeft,
+			"issuer":     certRes.issuerKey, // previous/current issuer
+		}); err != nil {
+			return fmt.Errorf("renewing certificate aborted by event handler: %w", err)
 		}
 
-		privateKey, err := PEMDecodePrivateKey(certRes.PrivateKeyPEM)
+		// reuse or generate new private key for CSR
+		var privateKey crypto.PrivateKey
+		if cfg.ReusePrivateKeys {
+			privateKey, err = PEMDecodePrivateKey(certRes.PrivateKeyPEM)
+		} else {
+			privateKey, err = cfg.KeySource.GenerateKey()
+		}
 		if err != nil {
 			return err
 		}
-		csr, err := cfg.generateCSR(privateKey, []string{name})
+
+		// if we generated a new key, make sure to replace its PEM encoding too!
+		if !cfg.ReusePrivateKeys {
+			certRes.PrivateKeyPEM, err = PEMEncodePrivateKey(privateKey)
+			if err != nil {
+				return err
+			}
+		}
+
+		csr, err := cfg.generateCSR(privateKey, []string{name}, false)
 		if err != nil {
 			return err
 		}
@@ -748,7 +861,21 @@ func (cfg *Config) renewCert(ctx context.Context, name string, force, interactiv
 		// try to obtain from each issuer until we succeed
 		var issuedCert *IssuedCertificate
 		var issuerUsed Issuer
+		var issuerKeys []string
 		for _, issuer := range cfg.Issuers {
+			// TODO: ZeroSSL's API currently requires CommonName to be set, and requires it be
+			// distinct from SANs. If this was a cert it would violate the BRs, but their certs
+			// are compliant, so their CSR requirements just needlessly add friction, complexity,
+			// and inefficiency for clients. CommonName has been deprecated for 25+ years.
+			useCSR := csr
+			if _, ok := issuer.(*ZeroSSLIssuer); ok {
+				useCSR, err = cfg.generateCSR(privateKey, []string{name}, true)
+				if err != nil {
+					return err
+				}
+			}
+
+			issuerKeys = append(issuerKeys, issuer.IssuerKey())
 			if prechecker, ok := issuer.(PreChecker); ok {
 				err = prechecker.PreCheck(ctx, []string{name}, interactive)
 				if err != nil {
@@ -756,7 +883,19 @@ func (cfg *Config) renewCert(ctx context.Context, name string, force, interactiv
 				}
 			}
 
-			issuedCert, err = issuer.Issue(ctx, csr)
+			// if we're renewing with the same ACME CA as before, have the ACME
+			// client tell the server we are replacing a certificate (but doing
+			// this on the wrong CA, or when the CA doesn't recognize the certID,
+			// can fail the order)
+			if acmeData, err := certRes.getACMEData(); err == nil && acmeData.CA != "" {
+				if acmeIss, ok := issuer.(*ACMEIssuer); ok {
+					if acmeIss.CA == acmeData.CA {
+						ctx = context.WithValue(ctx, ctxKeyARIReplaces, leaf)
+					}
+				}
+			}
+
+			issuedCert, err = issuer.Issue(ctx, useCSR)
 			if err == nil {
 				issuerUsed = issuer
 				break
@@ -769,39 +908,62 @@ func (cfg *Config) renewCert(ctx context.Context, name string, force, interactiv
 			if errors.As(err, &problem) {
 				errToLog = problem
 			}
-			if log != nil {
-				log.Error("could not get certificate from issuer",
-					zap.String("identifier", name),
-					zap.String("issuer", issuer.IssuerKey()),
-					zap.Error(errToLog))
-			}
+			log.Error("could not get certificate from issuer",
+				zap.String("identifier", name),
+				zap.String("issuer", issuer.IssuerKey()),
+				zap.Error(errToLog))
 		}
 		if err != nil {
+			cfg.emit(ctx, "cert_failed", map[string]any{
+				"renewal":    true,
+				"identifier": name,
+				"remaining":  timeLeft,
+				"issuers":    issuerKeys,
+				"error":      err,
+			})
+
 			// only the error from the last issuer will be returned, but we logged the others
 			return fmt.Errorf("[%s] Renew: %w", name, err)
 		}
+		issuerKey := issuerUsed.IssuerKey()
 
 		// success - immediately save the renewed certificate resource
+		metaJSON, err := json.Marshal(issuedCert.Metadata)
+		if err != nil {
+			log.Error("unable to encode certificate metadata", zap.Error(err))
+		}
 		newCertRes := CertificateResource{
 			SANs:           namesFromCSR(csr),
 			CertificatePEM: issuedCert.Certificate,
 			PrivateKeyPEM:  certRes.PrivateKeyPEM,
-			IssuerData:     issuedCert.Metadata,
+			IssuerData:     metaJSON,
+			issuerKey:      issuerKey,
 		}
 		err = cfg.saveCertResource(ctx, issuerUsed, newCertRes)
 		if err != nil {
 			return fmt.Errorf("[%s] Renew: saving assets: %v", name, err)
 		}
 
-		cfg.emit("cert_renewed", CertificateEventData{
-			Name:       name,
-			IssuerKey:  issuerUsed.IssuerKey(),
-			StorageKey: certRes.NamesKey(),
-		})
+		log.Info("certificate renewed successfully",
+			zap.String("identifier", name),
+			zap.String("issuer", issuerKey))
 
-		if log != nil {
-			log.Info("certificate renewed successfully", zap.String("identifier", name))
-		}
+		certKey := newCertRes.NamesKey()
+
+		cfg.emit(ctx, "cert_obtained", map[string]any{
+			"renewal":          true,
+			"remaining":        timeLeft,
+			"identifier":       name,
+			"issuer":           issuerKey,
+			"storage_path":     StorageKeys.CertsSitePrefix(issuerKey, certKey),
+			"private_key_path": StorageKeys.SitePrivateKey(issuerKey, certKey),
+			"certificate_path": StorageKeys.SiteCert(issuerKey, certKey),
+			"metadata_path":    StorageKeys.SiteMeta(issuerKey, certKey),
+			"csr_pem": pem.EncodeToMemory(&pem.Block{
+				Type:  "CERTIFICATE REQUEST",
+				Bytes: csr.Raw,
+			}),
+		})
 
 		return nil
 	}
@@ -815,10 +977,16 @@ func (cfg *Config) renewCert(ctx context.Context, name string, force, interactiv
 	return err
 }
 
-func (cfg *Config) generateCSR(privateKey crypto.PrivateKey, sans []string) (*x509.CertificateRequest, error) {
+// generateCSR generates a CSR for the given SANs. If useCN is true, CommonName will get the first SAN (TODO: this is only a temporary hack for ZeroSSL API support).
+func (cfg *Config) generateCSR(privateKey crypto.PrivateKey, sans []string, useCN bool) (*x509.CertificateRequest, error) {
 	csrTemplate := new(x509.CertificateRequest)
 
 	for _, name := range sans {
+		// TODO: This is a temporary hack to support ZeroSSL API...
+		if useCN && csrTemplate.Subject.CommonName == "" && len(name) <= 64 {
+			csrTemplate.Subject.CommonName = name
+			continue
+		}
 		if ip := net.ParseIP(name); ip != nil {
 			csrTemplate.IPAddresses = append(csrTemplate.IPAddresses, ip)
 		} else if strings.Contains(name, "@") {
@@ -875,12 +1043,6 @@ func (cfg *Config) RevokeCert(ctx context.Context, domain string, reason int, in
 		if err != nil {
 			return fmt.Errorf("issuer %d (%s): %v", i, issuerKey, err)
 		}
-
-		cfg.emit("cert_revoked", CertificateEventData{
-			Name:       domain,
-			IssuerKey:  issuerKey,
-			StorageKey: certRes.NamesKey(),
-		})
 
 		err = cfg.deleteSiteAssets(ctx, issuerKey, domain)
 		if err != nil {
@@ -976,11 +1138,27 @@ func (cfg *Config) getChallengeInfo(ctx context.Context, identifier string) (Cha
 	return Challenge{Challenge: chalInfo}, true, nil
 }
 
+func (cfg *Config) transformSubject(ctx context.Context, logger *zap.Logger, name string) string {
+	if cfg.SubjectTransformer == nil {
+		return name
+	}
+	transformedName := cfg.SubjectTransformer(ctx, name)
+	if logger != nil && transformedName != name {
+		logger.Debug("transformed subject name",
+			zap.String("original", name),
+			zap.String("transformed", transformedName))
+	}
+	return transformedName
+}
+
 // checkStorage tests the storage by writing random bytes
 // to a random key, and then loading those bytes and
 // comparing the loaded value. If this fails, the provided
 // cfg.Storage mechanism should not be used.
 func (cfg *Config) checkStorage(ctx context.Context) error {
+	if cfg.DisableStorageCheck {
+		return nil
+	}
 	key := fmt.Sprintf("rw_test_%d", weakrand.Int())
 	contents := make([]byte, 1024*10) // size sufficient for one or two ACME resources
 	_, err := weakrand.Read(contents)
@@ -994,10 +1172,8 @@ func (cfg *Config) checkStorage(ctx context.Context) error {
 	defer func() {
 		deleteErr := cfg.Storage.Delete(ctx, key)
 		if deleteErr != nil {
-			if cfg.Logger != nil {
-				cfg.Logger.Error("deleting test key from storage",
-					zap.String("key", key), zap.Error(err))
-			}
+			cfg.Logger.Error("deleting test key from storage",
+				zap.String("key", key), zap.Error(err))
 		}
 		// if there was no other error, make sure
 		// to return any error returned from Delete
@@ -1060,28 +1236,26 @@ func (cfg *Config) lockKey(op, domainName string) string {
 
 // managedCertNeedsRenewal returns true if certRes is expiring soon or already expired,
 // or if the process of decoding the cert and checking its expiration returned an error.
-func (cfg *Config) managedCertNeedsRenewal(certRes CertificateResource) (time.Duration, bool) {
+// If there wasn't an error, the leaf cert is also returned, so it can be reused if
+// necessary, since we are parsing the PEM bundle anyway.
+func (cfg *Config) managedCertNeedsRenewal(certRes CertificateResource, emitLogs bool) (time.Duration, *x509.Certificate, bool) {
 	certChain, err := parseCertsFromPEMBundle(certRes.CertificatePEM)
-	if err != nil {
-		return 0, true
+	if err != nil || len(certChain) == 0 {
+		return 0, nil, true
 	}
-	remaining := time.Until(certChain[0].NotAfter)
-	needsRenew := currentlyInRenewalWindow(certChain[0].NotBefore, certChain[0].NotAfter, cfg.RenewalWindowRatio)
-	return remaining, needsRenew
+	var ari acme.RenewalInfo
+	if ariPtr, err := certRes.getARI(); err == nil && ariPtr != nil {
+		ari = *ariPtr
+	}
+	remaining := time.Until(expiresAt(certChain[0]))
+	return remaining, certChain[0], cfg.certNeedsRenewal(certChain[0], ari, emitLogs)
 }
 
-func (cfg *Config) emit(eventName string, data interface{}) {
+func (cfg *Config) emit(ctx context.Context, eventName string, data map[string]any) error {
 	if cfg.OnEvent == nil {
-		return
-	}
-	cfg.OnEvent(eventName, data)
-}
-
-func loggerNamed(l *zap.Logger, name string) *zap.Logger {
-	if l == nil {
 		return nil
 	}
-	return l.Named(name)
+	return cfg.OnEvent(ctx, eventName, data)
 }
 
 // CertificateSelector is a type which can select a certificate to use given multiple choices.
@@ -1103,20 +1277,10 @@ type OCSPConfig struct {
 	// embedded in certificates. Mapping to an empty
 	// URL will disable OCSP from that responder.
 	ResponderOverrides map[string]string
-}
 
-// CertificateEventData contains contextual information for
-// an obtained, renewed or revoked certificate.
-// EXPERIMENTAL: subject to change.
-type CertificateEventData struct {
-	// Domain or subject name of the certificate.
-	Name string
-
-	// Storage key for the issuer used for this certificate.
-	IssuerKey string
-
-	// Location in storage at which the certificate could be found.
-	StorageKey string
+	// Optionally specify a function that can return the URL
+	// for an HTTP proxy to use for OCSP-related HTTP requests.
+	HTTPProxy func(*http.Request) (*url.URL, error)
 }
 
 // certIssueLockOp is the name of the operation used

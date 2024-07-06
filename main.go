@@ -20,7 +20,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -37,13 +37,13 @@ import (
 	"github.com/ghostunnel/ghostunnel/socket"
 	"github.com/ghostunnel/ghostunnel/wildcard"
 
+	kingpin "github.com/alecthomas/kingpin/v2"
 	graphite "github.com/cyberdelia/go-metrics-graphite"
 	gsyslog "github.com/hashicorp/go-syslog"
 	http_dialer "github.com/mwitkow/go-http-dialer"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	metrics "github.com/rcrowley/go-metrics"
 	sqmetrics "github.com/square/go-sq-metrics"
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
 
 	prometheusmetrics "github.com/deathowl/go-metrics-prometheus"
 	"github.com/prometheus/client_golang/prometheus"
@@ -62,12 +62,14 @@ var (
 	pkcs11Module         *string //nolint:golint,unused
 	pkcs11TokenLabel     *string //nolint:golint,unused
 	pkcs11PIN            *string //nolint:golint,unused
+	useLandlock          *bool   //nolint:golint,unused
 )
 
 // Main flags (always supported)
 var (
 	app = kingpin.New("ghostunnel", "A simple SSL/TLS proxy with mutual authentication for securing non-TLS services.")
 
+	// Server flags
 	serverCommand             = app.Command("server", "Server mode (TLS listener -> plain TCP/UNIX target).")
 	serverListenAddress       = serverCommand.Flag("listen", "Address and port to listen on (can be HOST:PORT, unix:PATH, systemd:NAME or launchd:NAME).").PlaceHolder("ADDR").Required().String()
 	serverForwardAddress      = serverCommand.Flag("target", "Address to forward connections to (can be HOST:PORT or unix:PATH).").PlaceHolder("ADDR").Required().String()
@@ -87,8 +89,9 @@ var (
 	serverAutoACMEEmail       = serverCommand.Flag("auto-acme-email", "Email address associated with all ACME requests").PlaceHolder("EMAIL").String()
 	serverAutoACMEAgreedTOS   = serverCommand.Flag("auto-acme-agree-to-tos", "Agree to the Terms of Service of the ACME CA").Default("false").Bool()
 	serverAutoACMEProdCA      = serverCommand.Flag("auto-acme-ca", "Specify the URL to the ACME CA. Defaults to Let's Encrypt if not specified.").PlaceHolder("https://some-acme-ca.example.com/").String()
-	serverAutoACMETestCA      = serverCommand.Flag("auto-acme-testca", "Specify the URL to the ACME CA's Test/Staging environemnt. If set, all requests will go to this CA and --auto-acme-ca will be ignored.").PlaceHolder("https://testing.some-acme-ca.example.com/").String()
+	serverAutoACMETestCA      = serverCommand.Flag("auto-acme-testca", "Specify the URL to the ACME CA's Test/Staging environment. If set, all requests will go to this CA and --auto-acme-ca will be ignored.").PlaceHolder("https://testing.some-acme-ca.example.com/").String()
 
+	// Client flags
 	clientCommand       = app.Command("client", "Client mode (plain TCP/UNIX listener -> TLS target).")
 	clientListenAddress = clientCommand.Flag("listen", "Address and port to listen on (can be HOST:PORT, unix:PATH, systemd:NAME or launchd:NAME).").PlaceHolder("ADDR").Required().String()
 	// Note: can't use .TCP() for clientForwardAddress because we need to set the original string in tls.Config.ServerName.
@@ -113,7 +116,7 @@ var (
 	caBundlePath            = app.Flag("cacert", "Path to CA bundle file (PEM/X509). Uses system trust store by default.").Envar("CACERT_PATH").String()
 	enabledCipherSuites     = app.Flag("cipher-suites", "Set of cipher suites to enable, comma-separated, in order of preference (AES, CHACHA).").Default("AES,CHACHA").String()
 	useWorkloadAPI          = app.Flag("use-workload-api", "If true, certificate and root CAs are retrieved via the SPIFFE Workload API").Bool()
-	useWorkloadAPIAddr      = app.Flag("use-workload-api-addr", "If set, certificates and root CAs are retrieved via the SPIFFE Workload API at the specified address (implies --use-workload-api)").PlaceHolder("ADDR").String()
+	useWorkloadAPIAddr      = app.Flag("use-workload-api-addr", "If set, certificates and root CAs are retrieved via the SPIFFE Workload API at the specified address (implies --use-workload-api)").Envar("SPIFFE_ENDPOINT_SOCKET").PlaceHolder("ADDR").String()
 	allowUnsafeCipherSuites = app.Flag("allow-unsafe-cipher-suites", "Allow cipher suites deemed to be unsafe to be enabled via the cipher-suites flag.").Hidden().Default("false").Bool()
 
 	// Reloading and timeouts
@@ -128,9 +131,10 @@ var (
 	metricsInterval = app.Flag("metrics-interval", "Collect (and post/send) metrics every specified interval.").Default("30s").Duration()
 
 	// Status & logging
-	statusAddress = app.Flag("status", "Enable serving /_status and /_metrics on given HOST:PORT (or unix:SOCKET).").PlaceHolder("ADDR").String()
-	enableProf    = app.Flag("enable-pprof", "Enable serving /debug/pprof endpoints alongside /_status (for profiling).").Bool()
-	quiet         = app.Flag("quiet", "Silence log messages (can be all, conns, conn-errs, handshake-errs; repeat flag for more than one)").Default("").Enums("", "all", "conns", "handshake-errs", "conn-errs")
+	statusAddress  = app.Flag("status", "Enable serving /_status and /_metrics on given HOST:PORT (or unix:SOCKET).").PlaceHolder("ADDR").String()
+	enableProf     = app.Flag("enable-pprof", "Enable serving /debug/pprof endpoints alongside /_status (for profiling).").Bool()
+	enableShutdown = app.Flag("enable-shutdown", "Enable serving a /_shutdown endpoint alongside /_status to allow terminating via HTTP.").Default("false").Bool()
+	quiet          = app.Flag("quiet", "Silence log messages (can be all, conns, conn-errs, handshake-errs; repeat flag for more than one)").Default("").Enums("", "all", "conns", "handshake-errs", "conn-errs")
 
 	// Man page /help
 	helpMan = app.Flag("help-custom-man", "Generate a man page.").Hidden().PreAction(generateManPage).Bool()
@@ -143,6 +147,10 @@ func init() {
 		keychainIssuer = app.Flag("keychain-issuer", "Use local keychain identity with given issuer name (instead of keystore file).").PlaceHolder("CN").String()
 		if runtime.GOOS == "darwin" {
 			keychainRequireToken = app.Flag("keychain-require-token", "Require keychain identity to be from a physical token (sets 'access group' to 'token').").Bool()
+		} else {
+			// The "require token" flag doesn't do anything on Windows/Linux, so we hide it.
+			isFalse := false
+			keychainRequireToken = &isFalse
 		}
 	}
 
@@ -151,6 +159,10 @@ func init() {
 		pkcs11Module = app.Flag("pkcs11-module", "Path to PKCS11 module (SO) file (optional).").Envar("PKCS11_MODULE").PlaceHolder("PATH").ExistingFile()
 		pkcs11TokenLabel = app.Flag("pkcs11-token-label", "Token label for slot/key in PKCS11 module (optional).").Envar("PKCS11_TOKEN_LABEL").PlaceHolder("LABEL").String()
 		pkcs11PIN = app.Flag("pkcs11-pin", "PIN code for slot/key in PKCS11 module (optional).").Envar("PKCS11_PIN").PlaceHolder("PIN").String()
+	}
+
+	if runtime.GOOS == "linux" {
+		useLandlock = app.Flag("use-landlock", "If true, will use landlock to limit file and socket access on supported kernels.").Bool()
 	}
 
 	// Aliases for flags that were renamed to be backwards-compatible
@@ -168,6 +180,7 @@ var exitFunc = os.Exit
 type Context struct {
 	status          *statusHandler
 	statusHTTP      *http.Server
+	shutdownChannel chan bool
 	shutdownTimeout time.Duration
 	dial            func() (net.Conn, error)
 	metrics         *sqmetrics.SquareMetrics
@@ -190,7 +203,7 @@ func initLogger(syslog bool, flags []string) (err error) {
 	for _, flag := range flags {
 		if flag == "all" {
 			// If --quiet=all if passed, disable all logging
-			logger = log.New(ioutil.Discard, "", 0)
+			logger = log.New(io.Discard, "", 0)
 			return
 		}
 	}
@@ -213,8 +226,13 @@ func panicOnError(err error) {
 
 // Validate flags for both, server and client mode
 func validateFlags(app *kingpin.Application) error {
-	if *enableProf && *statusAddress == "" {
-		return fmt.Errorf("--enable-pprof requires --status to be set")
+	if *statusAddress == "" {
+		if *enableProf {
+			return fmt.Errorf("--enable-pprof requires --status to be set")
+		}
+		if *enableShutdown {
+			return fmt.Errorf("--enable-shutdown requires --status to be set")
+		}
 	}
 	if *metricsURL != "" && !strings.HasPrefix(*metricsURL, "http://") && !strings.HasPrefix(*metricsURL, "https://") {
 		return fmt.Errorf("--metrics-url should start with http:// or https://")
@@ -224,6 +242,9 @@ func validateFlags(app *kingpin.Application) error {
 	}
 	if *timeoutDuration == 0 {
 		return fmt.Errorf("--connect-timeout duration must not be zero")
+	}
+	if pkcs11Module != nil && *pkcs11Module != "" && useLandlock != nil && *useLandlock {
+		return fmt.Errorf("--use-landlock is not compatible with --pkcs11-module")
 	}
 	return nil
 }
@@ -351,13 +372,11 @@ func clientValidateFlags() error {
 		(*certPath != "" && *keyPath != ""),
 		// A certificate, with the key in a PKCS#11 module
 		(*certPath != "" && hasPKCS11()),
-		// SPIFFE Workload API
-		*useWorkloadAPI,
 		// No credentials needed if auth is disabled
 		*clientDisableAuth,
 	})
 
-	if hasValidCredentials == 0 {
+	if hasValidCredentials == 0 && !*useWorkloadAPI {
 		return errors.New("at least one of --keystore, --cert/--key, --keychain-identity/issuer (if supported) or --disable-authentication flags is required")
 	}
 	if hasValidCredentials > 1 {
@@ -404,12 +423,22 @@ func run(args []string) error {
 	// Logger
 	err := initLogger(useSyslog(), *quiet)
 	if err != nil {
-		logger.Printf("error initializing logger: %s\n", err)
-		os.Exit(1)
+		return fmt.Errorf("unable to set up logger: %v", err)
 	}
 
 	logger.SetPrefix(fmt.Sprintf("[%d] ", os.Getpid()))
 	logger.Printf("starting ghostunnel in %s mode", command)
+
+	// Landlock
+	if useLandlock != nil && *useLandlock {
+		logger.Printf("setting up landlock rules to limit process privileges")
+
+		// Ignore landlock errors (for now). Landlock is a relatively new feature
+		// and not supported on older kernels (net rules were added in v6.7, Jan
+		// 2024). We may change this in a future version of Ghostunnel as we get
+		// more comfortable with Landlock.
+		_ = setupLandlock(logger)
+	}
 
 	// Metrics
 	if *metricsGraphite != nil {
@@ -450,7 +479,7 @@ func run(args []string) error {
 
 		// Duplicating this call to getTLSConfigSource() in all switch cases
 		// because we need to complete the validation of the command flags first.
-		tlsConfigSource, err := getTLSConfigSource()
+		tlsConfigSource, err := getTLSConfigSource(*serverDisableAuth)
 		if err != nil {
 			return err
 		}
@@ -465,6 +494,7 @@ func run(args []string) error {
 		status := newStatusHandler(dial, *serverStatusTargetAddress)
 		context := &Context{
 			status:          status,
+			shutdownChannel: make(chan bool, 1),
 			shutdownTimeout: *shutdownTimeout,
 			dial:            dial,
 			metrics:         metrics,
@@ -487,7 +517,7 @@ func run(args []string) error {
 
 		// Duplicating this call to getTLSConfigSource() in all switch cases
 		// because we need to complete the validation of the command flags first.
-		tlsConfigSource, err := getTLSConfigSource()
+		tlsConfigSource, err := getTLSConfigSource(*clientDisableAuth)
 		if err != nil {
 			return err
 		}
@@ -516,6 +546,7 @@ func run(args []string) error {
 		status := newStatusHandler(dial, "")
 		context := &Context{
 			status:          status,
+			shutdownChannel: make(chan bool, 1),
 			shutdownTimeout: *shutdownTimeout,
 			dial:            dial,
 			metrics:         metrics,
@@ -612,6 +643,7 @@ func serverListen(context *Context) error {
 	go p.Accept()
 
 	context.status.Listening()
+	context.status.HandleWatchdog()
 	context.signalHandler(p)
 	p.Wait()
 
@@ -653,6 +685,7 @@ func clientListen(context *Context) error {
 	go p.Accept()
 
 	context.status.Listening()
+	context.status.HandleWatchdog()
 	context.signalHandler(p)
 	p.Wait()
 
@@ -680,6 +713,21 @@ func (context *Context) serveStatus() error {
 		}
 		promHandler.ServeHTTP(w, r)
 	})
+
+	if *enableShutdown {
+		mux.HandleFunc("/_shutdown", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+
+			logger.Printf("shutdown was requested via status endpoint")
+
+			context.shutdownChannel <- true
+
+			w.WriteHeader(http.StatusOK)
+		})
+	}
 
 	if *enableProf {
 		mux.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
@@ -833,10 +881,10 @@ func proxyLoggerFlags(flags []string) int {
 	return out
 }
 
-func getTLSConfigSource() (certloader.TLSConfigSource, error) {
+func getTLSConfigSource(disableAuth bool) (certloader.TLSConfigSource, error) {
 	if *useWorkloadAPI {
 		logger.Printf("using SPIFFE Workload API as certificate source")
-		source, err := certloader.TLSConfigSourceFromWorkloadAPI(*useWorkloadAPIAddr, logger)
+		source, err := certloader.TLSConfigSourceFromWorkloadAPI(*useWorkloadAPIAddr, disableAuth, logger)
 		if err != nil {
 			logger.Printf("error: unable to create workload API TLS source: %s\n", err)
 			return nil, err
@@ -861,7 +909,7 @@ func getTLSConfigSource() (certloader.TLSConfigSource, error) {
 		return source, nil
 	}
 
-	cert, err := buildCertificate(*keystorePath, *certPath, *keyPath, *keystorePass, *caBundlePath)
+	cert, err := buildCertificate(*keystorePath, *certPath, *keyPath, *keystorePass, *caBundlePath, logger)
 	if err != nil {
 		logger.Printf("error: unable to load certificates: %s\n", err)
 		return nil, err

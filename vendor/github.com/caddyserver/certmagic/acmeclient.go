@@ -16,10 +16,8 @@ package certmagic
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	weakrand "math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -28,14 +26,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mholt/acmez"
-	"github.com/mholt/acmez/acme"
+	"github.com/mholt/acmez/v2"
+	"github.com/mholt/acmez/v2/acme"
 	"go.uber.org/zap"
 )
-
-func init() {
-	weakrand.Seed(time.Now().UnixNano())
-}
 
 // acmeClient holds state necessary to perform ACME operations
 // for certificate management with an ACME account. Call
@@ -61,7 +55,7 @@ func (iss *ACMEIssuer) newACMEClientWithAccount(ctx context.Context, useTestCA, 
 	if iss.AccountKeyPEM != "" {
 		account, err = iss.GetAccount(ctx, []byte(iss.AccountKeyPEM))
 	} else {
-		account, err = iss.getAccount(ctx, client.Directory, iss.Email)
+		account, err = iss.getAccount(ctx, client.Directory, iss.getEmail())
 	}
 	if err != nil {
 		return nil, fmt.Errorf("getting ACME account: %v", err)
@@ -70,7 +64,10 @@ func (iss *ACMEIssuer) newACMEClientWithAccount(ctx context.Context, useTestCA, 
 	// register account if it is new
 	if account.Status == "" {
 		if iss.NewAccountFunc != nil {
+			// obtain lock here, since NewAccountFunc calls happen concurrently and they typically read and change the issuer
+			iss.mu.Lock()
 			account, err = iss.NewAccountFunc(ctx, iss, account)
+			iss.mu.Unlock()
 			if err != nil {
 				return nil, fmt.Errorf("account pre-registration callback: %v", err)
 			}
@@ -78,7 +75,7 @@ func (iss *ACMEIssuer) newACMEClientWithAccount(ctx context.Context, useTestCA, 
 
 		// agree to terms
 		if interactive {
-			if !iss.Agreed {
+			if !iss.isAgreed() {
 				var termsURL string
 				dir, err := client.GetDirectory(ctx)
 				if err != nil {
@@ -88,18 +85,23 @@ func (iss *ACMEIssuer) newACMEClientWithAccount(ctx context.Context, useTestCA, 
 					termsURL = dir.Meta.TermsOfService
 				}
 				if termsURL != "" {
-					iss.Agreed = iss.askUserAgreement(termsURL)
-					if !iss.Agreed {
+					agreed := iss.askUserAgreement(termsURL)
+					if !agreed {
 						return nil, fmt.Errorf("user must agree to CA terms")
 					}
+					iss.mu.Lock()
+					iss.agreed = agreed
+					iss.mu.Unlock()
 				}
 			}
 		} else {
 			// can't prompt a user who isn't there; they should
 			// have reviewed the terms beforehand
-			iss.Agreed = true
+			iss.mu.Lock()
+			iss.agreed = true
+			iss.mu.Unlock()
 		}
-		account.TermsOfServiceAgreed = iss.Agreed
+		account.TermsOfServiceAgreed = iss.isAgreed()
 
 		// associate account with external binding, if configured
 		if iss.ExternalAccount != nil {
@@ -135,88 +137,21 @@ func (iss *ACMEIssuer) newACMEClientWithAccount(ctx context.Context, useTestCA, 
 // independent of any particular ACME account. If useTestCA is true, am.TestCA
 // will be used if it is set; otherwise, the primary CA will be used.
 func (iss *ACMEIssuer) newACMEClient(useTestCA bool) (*acmez.Client, error) {
-	// ensure defaults are filled in
-	var caURL string
-	if useTestCA {
-		caURL = iss.TestCA
+	client, err := iss.newBasicACMEClient()
+	if err != nil {
+		return nil, err
 	}
-	if caURL == "" {
-		caURL = iss.CA
-	}
-	if caURL == "" {
-		caURL = DefaultACME.CA
+
+	// fill in a little more beyond a basic client
+	if useTestCA && iss.TestCA != "" {
+		client.Client.Directory = iss.TestCA
 	}
 	certObtainTimeout := iss.CertObtainTimeout
 	if certObtainTimeout == 0 {
 		certObtainTimeout = DefaultACME.CertObtainTimeout
 	}
-
-	// ensure endpoint is secure (assume HTTPS if scheme is missing)
-	if !strings.Contains(caURL, "://") {
-		caURL = "https://" + caURL
-	}
-	u, err := url.Parse(caURL)
-	if err != nil {
-		return nil, err
-	}
-	if u.Scheme != "https" && !isLoopback(u.Host) && !isInternal(u.Host) {
-		return nil, fmt.Errorf("%s: insecure CA URL (HTTPS required)", caURL)
-	}
-
-	// set up the dialers and resolver for the ACME client's HTTP client
-	dialer := &net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 2 * time.Minute,
-	}
-	if iss.Resolver != "" {
-		dialer.Resolver = &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-				return (&net.Dialer{
-					Timeout: 15 * time.Second,
-				}).DialContext(ctx, network, iss.Resolver)
-			},
-		}
-	}
-
-	// TODO: we could potentially reuse the HTTP transport and client
-	hc := iss.httpClient // TODO: is this racey?
-	if iss.httpClient == nil {
-		transport := &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			DialContext:           dialer.DialContext,
-			TLSHandshakeTimeout:   30 * time.Second, // increase to 30s requested in #175
-			ResponseHeaderTimeout: 30 * time.Second, // increase to 30s requested in #175
-			ExpectContinueTimeout: 2 * time.Second,
-			ForceAttemptHTTP2:     true,
-		}
-		if iss.TrustedRoots != nil {
-			transport.TLSClientConfig = &tls.Config{
-				RootCAs: iss.TrustedRoots,
-			}
-		}
-
-		hc = &http.Client{
-			Transport: transport,
-			Timeout:   HTTPTimeout,
-		}
-
-		iss.httpClient = hc
-	}
-
-	client := &acmez.Client{
-		Client: &acme.Client{
-			Directory:   caURL,
-			PollTimeout: certObtainTimeout,
-			UserAgent:   buildUAString(),
-			HTTPClient:  hc,
-		},
-		ChallengeSolvers: make(map[string]acmez.Solver),
-	}
-	if iss.Logger != nil {
-		l := iss.Logger.Named("acme_client")
-		client.Client.Logger, client.Logger = l, l
-	}
+	client.Client.PollTimeout = certObtainTimeout
+	client.ChallengeSolvers = make(map[string]acmez.Solver)
 
 	// configure challenges (most of the time, DNS challenge is
 	// exclusive of other ones because it is usually only used
@@ -224,38 +159,24 @@ func (iss *ACMEIssuer) newACMEClient(useTestCA bool) (*acmez.Client, error) {
 	if iss.DNS01Solver == nil {
 		// enable HTTP-01 challenge
 		if !iss.DisableHTTPChallenge {
-			useHTTPPort := HTTPChallengePort
-			if HTTPPort > 0 && HTTPPort != HTTPChallengePort {
-				useHTTPPort = HTTPPort
-			}
-			if iss.AltHTTPPort > 0 {
-				useHTTPPort = iss.AltHTTPPort
-			}
 			client.ChallengeSolvers[acme.ChallengeTypeHTTP01] = distributedSolver{
 				storage:                iss.config.Storage,
 				storageKeyIssuerPrefix: iss.storageKeyCAPrefix(client.Directory),
 				solver: &httpSolver{
-					acmeIssuer: iss,
-					address:    net.JoinHostPort(iss.ListenHost, strconv.Itoa(useHTTPPort)),
+					handler: iss.HTTPChallengeHandler(http.NewServeMux()),
+					address: net.JoinHostPort(iss.ListenHost, strconv.Itoa(iss.getHTTPPort())),
 				},
 			}
 		}
 
 		// enable TLS-ALPN-01 challenge
 		if !iss.DisableTLSALPNChallenge {
-			useTLSALPNPort := TLSALPNChallengePort
-			if HTTPSPort > 0 && HTTPSPort != TLSALPNChallengePort {
-				useTLSALPNPort = HTTPSPort
-			}
-			if iss.AltTLSALPNPort > 0 {
-				useTLSALPNPort = iss.AltTLSALPNPort
-			}
 			client.ChallengeSolvers[acme.ChallengeTypeTLSALPN01] = distributedSolver{
 				storage:                iss.config.Storage,
 				storageKeyIssuerPrefix: iss.storageKeyCAPrefix(client.Directory),
 				solver: &tlsALPNSolver{
 					config:  iss.config,
-					address: net.JoinHostPort(iss.ListenHost, strconv.Itoa(useTLSALPNPort)),
+					address: net.JoinHostPort(iss.ListenHost, strconv.Itoa(iss.getTLSALPNPort())),
 				},
 			}
 		}
@@ -286,9 +207,70 @@ func (iss *ACMEIssuer) newACMEClient(useTestCA bool) (*acmez.Client, error) {
 	return client, nil
 }
 
+// newBasicACMEClient sets up a basically-functional ACME client that is not capable
+// of solving challenges but can provide basic interactions with the server.
+func (iss *ACMEIssuer) newBasicACMEClient() (*acmez.Client, error) {
+	caURL := iss.CA
+	if caURL == "" {
+		caURL = DefaultACME.CA
+	}
+	// ensure endpoint is secure (assume HTTPS if scheme is missing)
+	if !strings.Contains(caURL, "://") {
+		caURL = "https://" + caURL
+	}
+	u, err := url.Parse(caURL)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "https" && !SubjectIsInternal(u.Host) {
+		return nil, fmt.Errorf("%s: insecure CA URL (HTTPS required for non-internal CA)", caURL)
+	}
+	return &acmez.Client{
+		Client: &acme.Client{
+			Directory:  caURL,
+			UserAgent:  buildUAString(),
+			HTTPClient: iss.httpClient,
+			Logger:     iss.Logger.Named("acme_client"),
+		},
+	}, nil
+}
+
+// GetRenewalInfo gets the ACME Renewal Information (ARI) for the certificate.
+func (iss *ACMEIssuer) GetRenewalInfo(ctx context.Context, cert Certificate) (acme.RenewalInfo, error) {
+	acmeClient, err := iss.newBasicACMEClient()
+	if err != nil {
+		return acme.RenewalInfo{}, err
+	}
+	return acmeClient.GetRenewalInfo(ctx, cert.Certificate.Leaf)
+}
+
+func (iss *ACMEIssuer) getHTTPPort() int {
+	useHTTPPort := HTTPChallengePort
+	if HTTPPort > 0 && HTTPPort != HTTPChallengePort {
+		useHTTPPort = HTTPPort
+	}
+	if iss.AltHTTPPort > 0 {
+		useHTTPPort = iss.AltHTTPPort
+	}
+	return useHTTPPort
+}
+
+func (iss *ACMEIssuer) getTLSALPNPort() int {
+	useTLSALPNPort := TLSALPNChallengePort
+	if HTTPSPort > 0 && HTTPSPort != TLSALPNChallengePort {
+		useTLSALPNPort = HTTPSPort
+	}
+	if iss.AltTLSALPNPort > 0 {
+		useTLSALPNPort = iss.AltTLSALPNPort
+	}
+	return useTLSALPNPort
+}
+
 func (c *acmeClient) throttle(ctx context.Context, names []string) error {
+	email := c.iss.getEmail()
+
 	// throttling is scoped to CA + account email
-	rateLimiterKey := c.acmeClient.Directory + "," + c.iss.Email
+	rateLimiterKey := c.acmeClient.Directory + "," + email
 	rateLimitersMu.Lock()
 	rl, ok := rateLimiters[rateLimiterKey]
 	if !ok {
@@ -297,24 +279,20 @@ func (c *acmeClient) throttle(ctx context.Context, names []string) error {
 		// TODO: stop rate limiter when it is garbage-collected...
 	}
 	rateLimitersMu.Unlock()
-	if c.iss.Logger != nil {
-		c.iss.Logger.Info("waiting on internal rate limiter",
-			zap.Strings("identifiers", names),
-			zap.String("ca", c.acmeClient.Directory),
-			zap.String("account", c.iss.Email),
-		)
-	}
+	c.iss.Logger.Info("waiting on internal rate limiter",
+		zap.Strings("identifiers", names),
+		zap.String("ca", c.acmeClient.Directory),
+		zap.String("account", email),
+	)
 	err := rl.Wait(ctx)
 	if err != nil {
 		return err
 	}
-	if c.iss.Logger != nil {
-		c.iss.Logger.Info("done waiting on internal rate limiter",
-			zap.Strings("identifiers", names),
-			zap.String("ca", c.acmeClient.Directory),
-			zap.String("account", c.iss.Email),
-		)
-	}
+	c.iss.Logger.Info("done waiting on internal rate limiter",
+		zap.Strings("identifiers", names),
+		zap.String("ca", c.acmeClient.Directory),
+		zap.String("account", email),
+	)
 	return nil
 }
 
@@ -333,6 +311,15 @@ func buildUAString() string {
 		ua = UserAgent + " " + ua
 	}
 	return ua
+}
+
+// RenewalInfoGetter is a type that can get ACME Renewal Information (ARI).
+// Users of this package that wrap the ACMEIssuer or use any other issuer
+// that supports ARI will need to implement this so that CertMagic can
+// update ARI which happens outside the normal issuance flow and is thus
+// not required by the Issuer interface (a type assertion is performed).
+type RenewalInfoGetter interface {
+	GetRenewalInfo(context.Context, Certificate) (acme.RenewalInfo, error)
 }
 
 // These internal rate limits are designed to prevent accidentally

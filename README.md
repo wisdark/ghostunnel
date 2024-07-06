@@ -91,10 +91,11 @@ To run tests:
     make test
 
     # Option 2: run unit & integration tests in a Docker container
-    GO_VERSION=1.19 make docker-test
+    # This also runs PKCS#11 integration tests using SoftHSM in the container
+    GO_VERSION=1.22 make docker-test
 
     # Open coverage information in browser
-    go tool cover -html coverage-merged.out
+    go tool cover -html coverage/all.profile
 
 For more information on how to contribute, please see the [CONTRIBUTING](CONTRIBUTING.md) file.
 
@@ -268,7 +269,7 @@ check.
 
 ### Certificate Hotswapping
 
-To trigger a reload, simply send `SIGUSR1` to the process or set a time-based
+To trigger a reload, simply send `SIGHUP` to the process or set a time-based
 reloading interval with the `--timed-reload` flag. This will cause ghostunnel
 to reload the certificate and private key from the files on disk. Once
 successful, the reloaded certificate will be used for new connections going

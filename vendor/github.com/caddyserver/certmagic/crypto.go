@@ -22,7 +22,6 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -35,6 +34,7 @@ import (
 	"strings"
 
 	"github.com/klauspost/cpuid/v2"
+	"github.com/zeebo/blake3"
 	"go.uber.org/zap"
 	"golang.org/x/net/idna"
 )
@@ -226,14 +226,12 @@ func (cfg *Config) loadCertResourceAnyIssuer(ctx context.Context, certNamesKey s
 		return certResources[j].decoded.NotBefore.Before(certResources[i].decoded.NotBefore)
 	})
 
-	if cfg.Logger != nil {
-		cfg.Logger.Debug("loading managed certificate",
-			zap.String("domain", certNamesKey),
-			zap.Time("expiration", certResources[0].decoded.NotAfter),
-			zap.String("issuer_key", certResources[0].issuer.IssuerKey()),
-			zap.Any("storage", cfg.Storage),
-		)
-	}
+	cfg.Logger.Debug("loading managed certificate",
+		zap.String("domain", certNamesKey),
+		zap.Time("expiration", expiresAt(certResources[0].decoded)),
+		zap.String("issuer_key", certResources[0].issuer.IssuerKey()),
+		zap.Any("storage", cfg.Storage),
+	)
 
 	return certResources[0].CertificateResource, nil
 }
@@ -273,7 +271,7 @@ func (cfg *Config) loadCertResource(ctx context.Context, issuer Issuer, certName
 // which is the chain of DER-encoded bytes. It returns the
 // hex encoding of the hash.
 func hashCertificateChain(certChain [][]byte) string {
-	h := sha256.New()
+	h := blake3.New()
 	for _, certInChain := range certChain {
 		h.Write(certInChain)
 	}
@@ -282,6 +280,11 @@ func hashCertificateChain(certChain [][]byte) string {
 
 func namesFromCSR(csr *x509.CertificateRequest) []string {
 	var nameSet []string
+	// TODO: CommonName should not be used (it has been deprecated for 25+ years,
+	// but ZeroSSL CA still requires it to be filled out and not overlap SANs...)
+	if csr.Subject.CommonName != "" {
+		nameSet = append(nameSet, csr.Subject.CommonName)
+	}
 	nameSet = append(nameSet, csr.DNSNames...)
 	nameSet = append(nameSet, csr.EmailAddresses...)
 	for _, v := range csr.IPAddresses {

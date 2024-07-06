@@ -21,7 +21,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 
 	certigo "github.com/square/certigo/lib"
@@ -32,6 +31,7 @@ func readPEM(path, password, format string) ([]*pem.Block, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer file.Close()
 
 	var pemBlocks []*pem.Block
 	err = certigo.ReadAsPEMFromFiles(
@@ -57,6 +57,7 @@ func readX509(path string) ([]*x509.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer file.Close()
 
 	errs := []error{}
 	out := []*x509.Certificate{}
@@ -85,7 +86,7 @@ func LoadTrustStore(caBundlePath string) (*x509.CertPool, error) {
 		return x509.SystemCertPool()
 	}
 
-	caBundleBytes, err := ioutil.ReadFile(caBundlePath)
+	caBundleBytes, err := os.ReadFile(caBundlePath)
 	if err != nil {
 		return nil, err
 	}
